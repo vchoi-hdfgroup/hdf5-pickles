@@ -1,0 +1,325 @@
+# The native VOL's address<->token conversion pair writes/reads the FILE's
+# declared sizeof_addr worth of bytes into/out of a token buffer whose real
+# size is a FIXED constant (H5O_MAX_TOKEN_SIZE == 16, src/H5public.h:445-456),
+# with no bound check of its own. This repo already tracks the superblock
+# gate that lets sizeof_addr reach 32 at open time even though the creation
+# API only ever allows up to 16 (registry/cases/wide-length-16-decode-gap.yml,
+# memory three-width-gates-and-report3-overlap) -- that record is about a
+# DIFFERENT sink (H5_DECODE_LENGTH_LEN, used for message-internal length
+# fields, measured NOT memory-unsafe under NDEBUG because its destinations are
+# pre-zeroed and its cursor doesn't advance on overflow). This record is the
+# token-conversion sink specifically: H5F_addr_encode_len/decode_len have no
+# such safety net -- they write/read exactly addr_len bytes, unconditionally,
+# into whatever buffer they're given, and for the token functions that buffer
+# is 16 bytes no matter what addr_len says.
+#
+# ~/hdf5_security_reports.md's "Note on sizeof_addr" section (2026-09-02)
+# already looked at H5F_addr_decode_len in general and found it non-overflowing
+# for ordinary structural-address decode (the destination is always a native
+# 8-byte haddr_t, and only the low 8 bytes accumulate) -- correct, for THAT
+# call shape. It did not examine the token-conversion functions, where the
+# destination is the 16-byte H5O_token_t rather than an 8-byte haddr_t, and
+# where the ENCODE direction writes rather than reads. That is the gap this
+# record closes.
+schema_version: 1
+
+id: addr-token-encode-decode-stack-overflow
+title: H5VL_native_addr_to_token/token_to_addr use the file's declared
+  sizeof_addr (attacker-controlled, up to 32 at open time) to size a raw byte
+  loop into/out of a fixed 16-byte H5O_token_t, with no bound against the
+  token's real size in either direction
+status: contained                # h5policy refuses at superblock preflight, same gate as wide-length-16-decode-gap; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only. No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up. Re-derived and measured
+  locally against the current source tree.
+
+# -- Triage -------------------------------------------------------------------
+record: address_space_bounds
+versions: [32]                    # sizeof_addr byte width, not a message version -- see wide-length-16-decode-gap
+root_cause_classification: local_decode
+violated_invariant:
+  - address.library_compatibility  # same invariant wide-length-16-decode-gap already added for this class of gate
+validation_closure: >-
+  the superblock's declared sizeof_offsets byte alone establishes the defect;
+  no other record is needed to reach it. h5policy's existing
+  h5policy_width_supported() gate (h5policy/pickles/h5_validate.pk, checked at
+  both the v0/v1 and v2/v3 superblock paths, ~lines 132/360/494) already
+  refuses any sizeof_offsets outside its supported set at preflight -- it was
+  written for the wide-length-16-decode-gap class and covers this one for
+  free, since both gates read the identical superblock byte.
+activation_before_validation:
+  - native_construction            # any H5Oget_info3/H5Lget_info-family call on an already-open object
+entry_points:
+  - "h5policy (oracle) -- unsupported_coverage_gap, H5_UNSUPPORTED_PICKLE_COVERAGE_GAP, at superblock preflight. Never reaches token conversion."
+  - "libhdf5 write direction: H5Oget_info3 -> H5O__get_info -> H5VL_native_addr_to_token (src/H5Oint.c:2130) -> H5F_addr_encode_len (src/H5Fint.c:2946-2969)"
+  - "libhdf5 write direction, other callers: H5Lget_info-family (src/H5Glink.c:208), H5Rcreate_object (src/H5Ocopy_ref.c:193,362), H5VLnative_addr_to_token public entry (src/H5VLnative.c:413), H5Odeprec.c:381, H5VLnative_object.c:374"
+  - "libhdf5 read direction: H5Rdereference/H5Ropen_object-family -> H5VL_native_token_to_addr (src/H5VLnative.c:523-546) -> H5F_addr_decode_len (src/H5Fint.c:3008-3054)"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ----------------------
+defect: >-
+  `H5O_token_t` is a fixed 16-byte opaque struct (src/H5public.h:445-456,
+  `H5O_MAX_TOKEN_SIZE == 16`). `H5VL_native_addr_to_token`
+  (src/H5VLnative.c:430-455):
+    p = (uint8_t *)token;
+    H5F_addr_encode_len(addr_len, &p, addr);          -- addr_len from the FILE
+  `H5F_addr_encode_len` (src/H5Fint.c:2946-2969) loops `addr_len` times writing
+  one byte per iteration into `*pp`, unconditionally -- no check against
+  whatever buffer it was actually given. `addr_len` comes from
+  `H5VL__native_get_file_addr_len`, i.e. `H5F_SIZEOF_ADDR(f)`, the FILE's own
+  declared sizeof_addr -- attacker-controlled via the superblock, and per
+  `wide-length-16-decode-gap`, the OPEN-time gate
+  (`H5F__cache_superblock_deserialize`) accepts {2,4,8,16,32} while the
+  CREATION api (`H5Pset_sizes`) only ever allows up to 16. At addr_len==16 the
+  write exactly fills the 16-byte token, no overflow. At addr_len==32 (only
+  reachable via the open-time gate, never via legitimate creation) it writes
+  32 bytes into 16 -- a genuine stack buffer overflow WRITE, since `token` is
+  always a caller-local `H5O_token_t` on the stack.
+  The reverse direction, `H5VL_native_token_to_addr` -> `H5F_addr_decode_len`
+  (src/H5Fint.c:3008-3054), reads `addr_len` bytes FROM the 16-byte token
+  (only the low 8 accumulate into the output `haddr_t`, the rest are read and
+  discarded/asserted) -- an out-of-bounds READ of the same 16 bytes, milder
+  (no corruption) but still a real ASan-flagged violation.
+
+# -- Measured behaviour (2026-09-07) --------------------------------------------
+measured:
+  fixture: >-
+    A genuinely width-32-self-consistent minimal file, `wide32.h5` (339
+    bytes), NOT a one-byte shortcut patch -- a shortcut (flip only the
+    sizeof_addr byte on an otherwise 8-byte-address file) was already shown
+    not to work by ~/hdf5_security_reports.md's own prior measurement (assert
+    build aborts in H5Fopen; release build "opens" but then fails every
+    structural read). Built from an empty h5py libver='latest' group: every
+    address-valued field enumerated (the superblock's 4 -- base, superblock
+    extension, EOF, root group object header -- plus the root group's own
+    Link Info message's 2 -- fractal heap addr, name-index v2 B-tree addr,
+    both HADDR_UNDEF in this minimal case) and widened from 8 to 32 bytes
+    each (zero-padded if defined, all-0xff if undefined), sizeof_offsets byte
+    set to 32, both affected checksums recomputed (superblock chksum and the
+    OHDR chunk0 checksum, Jenkins lookup3, self-checked against the seed's
+    real checksums first). Opens cleanly on stock libhdf5: h5dump -H and
+    h5debug both confirm "Size of file offsets: 32 bytes" and the correct
+    root group address (144).
+  write_direction: >-
+    Confirmed via gdb that addr_len=32 reaches the encode loop, then with an
+    explicitly ASan-compiled test harness calling the public
+    H5VLnative_addr_to_token entry point directly (note: h5cc does not pass
+    -fsanitize=address to CALLER code, only to the library itself -- the
+    harness needs its own explicit ASan flags to get stack redzones on its
+    own frame):
+      AddressSanitizer: stack-buffer-overflow WRITE of size 1
+        #0 H5F_addr_encode_len       H5Fint.c:2958
+        #1 H5VL_native_addr_to_token H5VLnative.c:451
+        #2 H5VLnative_addr_to_token  H5VLnative.c:413
+      frame: [32,48) 'token'  <== overflows this variable
+  read_direction: >-
+    Confirmed the same way, this time caught inside libhdf5's own
+    ASan-instrumented frame directly:
+      AddressSanitizer: stack-buffer-overflow READ of size 1
+        #0 H5F_addr_decode_len       H5Fint.c:3028
+        #1 H5VL_native_token_to_addr H5VLnative.c:541
+  self_masking_at_the_common_call_site: >-
+    IMPORTANT NUANCE. The most ordinary trigger, H5Oget_info3, does NOT show
+    visible corruption even though the overflow still occurs: H5O__reset_info2
+    memsets the destination info struct to 0 immediately before the call, the
+    overflow writes 24 zero bytes (any real haddr_t fits in far fewer than 16
+    bytes, so nothing past byte 8 is ever nonzero) over already-zero memory,
+    and the struct's other fields (type, rc) are explicitly reassigned right
+    afterward in the same function. Demonstrating a clean ASan trace required
+    going around that masking via the public H5VLnative_addr_to_token entry
+    point with an explicit addr and a bare local token, which is a real,
+    directly-reachable public API, not a synthetic bypass.
+    NOT YET DEMONSTRATED, and the natural next step: a call site where the
+    token buffer is a bare stack local reused across encode/decode without an
+    intervening memset -- H5Ocopy_ref.c:193's `tmp_token` (inside a
+    reference-expansion loop) is a promising untested candidate. Until that is
+    shown, this record's confirmed impact is "a real, ASan-provable stack
+    buffer overflow reachable from public API," not yet "demonstrated to
+    corrupt a value that matters."
+  oracle: >-
+    h5policy on wide32.h5: refuses at superblock preflight,
+    H5_UNSUPPORTED_PICKLE_COVERAGE_GAP, same shape as wide-length-16-decode-gap
+    (h5policy_width_supported() gate). Never reaches token conversion, since
+    it never gets past the superblock.
+  width: 64-bit only; no 32-bit measurement.
+
+# -- Divergence from the selected build -----------------------------------
+divergence:
+  oracle: unsupported_coverage_gap (conservative refusal, target-specific containment)
+  libhdf5: stack-buffer-overflow WRITE (encode) and READ (decode), both ASan-confirmed
+  libhdf5_version: 2.3.0
+  classification: >-
+    Agreement in effect: h5policy's pre-existing width gate (added for the
+    length-macro sibling, not for this) happens to refuse every file that
+    could reach this sink too, since both gates read the same superblock byte.
+    No new oracle work needed; the containment was already there, just not
+    for the reason it was written.
+  note: >-
+    No malformed/ fixture added. wide_length_one.h5's sizeof_lengths=16
+    sibling stays the direct regression for the WIDTH GATE ITSELF;
+    reproducing this specific sink needs sizeof_addr=32 (not 16, which does
+    not overflow the token) AND full self-consistency, which is a much
+    heavier fixture than this repo's corpus convention for a gate that is
+    already closed. wide32.h5 is not committed -- see provenance.
+
+# -- Containment vs systemic remediation ---------------------------------
+containment:
+  status: oracle_only
+  description: >-
+    libhdf5: bound addr_len against sizeof(H5O_token_t) (16) before the
+    encode/decode loop in both H5F_addr_encode_len and H5F_addr_decode_len, or
+    equivalently clamp/reject in H5VL_native_addr_to_token/token_to_addr
+    themselves, since the general-purpose address encode/decode pair is used
+    for many buffer shapes (structural addresses too, per
+    ~/hdf5_security_reports.md's note) and only the token callers have a
+    fixed-size destination smaller than 32.
+    h5policy: already sufficient. The width gate that exists for the
+    length-macro sibling closes this one as a side effect, since both are
+    gated on the same superblock byte before any deeper decode.
+systemic:
+  semantic_boundary: >-
+    "the file's declared address width" is used, unexamined, to size a
+    fixed-size in-memory structure (H5O_token_t) that was never designed to
+    hold more than 16 bytes. Three width gates already disagree on this field
+    (creation API {2,4,8,16}, open-time decoder {2,4,8,16,32}, this sink's
+    destination {16 exactly), and none of the three was written with the
+    other two in mind.
+  status: open
+  owner: unassigned
+  description: >-
+    The systemic fix is the same one wide-length-16-decode-gap already
+    proposes for its own sink: narrow the open-time gate to match the
+    creation API ({2,4,8}, or at most {2,4,8,16}), which closes both sinks at
+    once and needs no per-sink patch.
+
+# -- Reproducers ----------------------------------------------------------
+reproducers:
+  integration_poc: none tracked, deliberately -- see divergence.note.
+  generator: >-
+    RECIPE, verified 2026-09-07. Build an empty h5py libver='latest' group;
+    enumerate every address-valued field in the superblock (4 fields) and the
+    root group's own object header (however many its messages carry -- 2 for
+    an empty group's Link Info message); re-serialize the whole file with
+    every one of those fields widened from 8 to 32 bytes (zero-padded low 8
+    bytes if defined, all-0xff if undefined), sizeof_offsets set to 32, and
+    both affected checksums (superblock, OHDR chunk0) recomputed via Jenkins
+    lookup3. Then call H5VLnative_addr_to_token (or reach H5Oget_info3, though
+    that call site self-masks -- see measured.self_masking_at_the_common_call_site)
+    under an EXPLICITLY ASan-compiled caller (h5cc alone does not instrument
+    caller code with -fsanitize=address).
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: true
+
+backports: []
+
+fuzz_seed: >-
+  n/a -- hand-built specimen requiring full structural self-consistency at a
+  non-default width; not reachable by mutation of an ordinary corpus file.
+
+sibling_audit: >-
+  registry/cases/wide-length-16-decode-gap.yml is the sibling gate
+  (sizeof_lengths, not sizeof_addr) and its own measured NDEBUG behavior (not
+  memory-unsafe: pre-zeroed destination, non-advancing cursor) does NOT carry
+  over to this record -- different function (H5_DECODE_LENGTH_LEN vs
+  H5F_addr_encode_len/decode_len), different destination shape (an 8-byte
+  haddr_t vs a 16-byte H5O_token_t), different direction (that record's sink
+  never encodes, only decodes). ~/hdf5_security_reports.md's own "Note on
+  sizeof_addr" section already distinguishes the two functions correctly but
+  only examined H5F_addr_decode_len's GENERAL structural-address use (always
+  an 8-byte destination, genuinely safe); it does not examine the token
+  conversion functions at all, which is the gap this record closes.
+
+# -- Affected versions ------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range. Measured at 2.3.0. The width gate itself is
+    long-standing per wide-length-16-decode-gap (open-time acceptance of
+    16/32 since 1.8.0); H5O_token_t and the VOL token-conversion functions are
+    newer (VOL connector API), so the token-specific overflow's true
+    introduction version is unestablished.
+  label: one point, not a range
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    NO UNMASKED CORRUPTION DEMONSTRATED YET. The confirmed ASan traces are
+    through the public H5VLnative_addr_to_token entry point with a bare local
+    token, not through an ordinary call site with a value that matters
+    afterward. H5Ocopy_ref.c:193's tmp_token (bare stack local, reused across
+    encode/decode inside a reference-expansion loop, no memset in between) is
+    the next candidate to try.
+  - No 32-bit measurement.
+  - >-
+    Whether any call site places `token` adjacent to something more
+    consequential than zeroed padding (a saved register, a return address, a
+    security-relevant local) depends on compiler/stack-layout specifics not
+    explored here -- this record establishes the primitive, not its worst-case
+    exploitability.
+
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working note; see the same field in
+# registry/cases/local-heap-free-list-bound-wraps.yml for why. NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    H5VL_native_addr_to_token/token_to_addr write/read the file's own
+    declared address width (accepted up to 32 at open time) into/from a
+    fixed 16-byte H5O_token_t, with no bound check of their own
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: unverified as a range; present at 2.3.0
+    patched_versions: none
+  vulnerable_functions: >-
+    H5F_addr_encode_len and H5F_addr_decode_len (src/H5Fint.c:2946-2969 and
+    :3008-3054), called from H5VL_native_addr_to_token / _token_to_addr
+    (src/H5VLnative.c:430-455, :523-546). Public entry points include
+    H5Oget_info3, the H5Lget_info family, and any reference-token round trip;
+    reaching the overflow requires a file whose superblock declares
+    sizeof_addr = 32, a value the open-time gate accepts but the
+    file-creation API never produces on its own.
+  severity: Medium
+  cvss: "CVSS:3.1/AV:L/AC:H/PR:N/UI:R/S:U/C:N/I:N/A:L (base 4.3)"
+  cvss_rationale: >-
+    A stack buffer overflow (write direction) and out-of-bounds read
+    (decode direction) are both demonstrated with a working, fully
+    self-consistent width-32 specimen. AC:H reflects that no ordinary
+    application can produce such a file; it must be hand-constructed.
+    Impact is capped conservatively at Low availability because the most
+    common call site (H5Oget_info3) happens to self-mask the write's
+    visible effect (destination memset to zero immediately before and
+    after) on builds/compilers I tested -- whether a different call site or
+    stack layout escalates this further is an open question I flag rather
+    than claim.
+  weaknesses: >-
+    CWE-787 (out-of-bounds write, encode direction); CWE-125 (out-of-bounds
+    read, decode direction); CWE-1284 (the file's own declared width used,
+    unbounded, to size an operation against a fixed-size structure).
+  workarounds: >-
+    None identified beyond validating sizeof_addr before use. A validation
+    layer that refuses sizeof_addr outside {2,4,8} at superblock preflight
+    (the same gate an unrelated finding of mine already needed) closes this
+    for free, since both read the identical superblock byte.
+
+provenance:
+  found_by: >-
+    local analysis, triaging an externally-supplied report against this
+    repo's already-tracked wide-length-16-decode-gap case; re-derived and
+    measured entirely locally, no advisory consulted
+  h5policy_commit: "branch updates/20260903, at 954882254293"
+  libhdf5_source: {branch: patch/20260903, commit: b5865e78549a, version: 2.3.0}
+  baseline_build: {version: 2.3.0, build_mode: RelWithDebInfo, sanitizers: []}
+  asan_build: {build_mode: RelWithDebInfo, sanitizers: [address], ndebug: true}  # workstation-local install; path not recorded
+  input_note: >-
+    wide32.h5 and its build script are not tracked -- see divergence.note.
+    Left in the scratchpad this session produced them in; not portable
+    evidence across hosts without re-running the generator.

@@ -1,0 +1,319 @@
+# The Multi/Split VFD's driver-info block stores a per-member-type NAME
+# TEMPLATE -- a string later handed to snprintf as the FORMAT STRING, with
+# exactly one vararg. h5policy already tracks the driver-info block's
+# address/length/version/reserved fields (registry/cases/driver-info-block-
+# fields-unbounded.yml) but has never modeled its member-map or name-template
+# content, because it doesn't model the multi/split VFD's member files at
+# all -- this isn't a scoped miss inside an existing invariant, it's a whole
+# record family with zero coverage.
+schema_version: 1
+
+id: multi-vfd-name-template-format-string
+title: H5FD_multi_sb_decode copies an attacker-controlled, unvalidated
+  per-member name template straight from the driver-info block into
+  file->fa.memb_name[mt], and open_members/H5FD_multi_delete pass it directly
+  to snprintf as the FORMAT STRING with only one vararg
+status: draft                     # genuinely new; no h5policy coverage exists to harden, and no libhdf5 fix proposed yet
+disclosure: >-
+  n/a -- local analysis only. No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: driver_info_block
+versions: [0]                     # driver-info block version (NCSAmult body)
+root_cause_classification: local_decode
+violated_invariant: []            # NONE EXIST -- h5policy does not model multi/split member maps or name templates at all; see defect
+validation_closure: >-
+  the driver-info block's member map (6 bytes) and, for each unique mapped
+  value, its address/EOA pair and its name-template string -- none of which
+  h5policy currently decodes past the block's own address/length/version
+  envelope (registry/cases/driver-info-block-fields-unbounded.yml). A closure
+  would need to reject any template byte outside a fixed safe set (no '%'
+  at minimum), which is a NEW invariant, not a fix to an existing one.
+activation_before_validation:
+  - native_construction            # H5Fopen itself, before any object in the file is touched
+entry_points:
+  - "h5policy (oracle) -- unsupported_coverage_gap; the multi/split VFD's member structure is entirely unmodeled, not selectively missed"
+  - "libhdf5 -- H5Fopen -> H5F__super_read -> H5FD_sb_load -> H5FD__sb_decode -> H5FD_multi_sb_decode (src/H5FDmulti.c:745-873) -> open_members (src/H5FDmulti.c:1917) / H5FD_multi_delete (src/H5FDmulti.c:1992)"
+  - "requires the caller to already have selected the multi or split VFD (H5Pset_fapl_multi / H5Pset_fapl_split) with a member map compatible enough to reach decode -- see divergence.reachability_correction, this is narrower than first assumed"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  H5FD_multi_sb_decode (src/H5FDmulti.c:745-873), after checking the 8-byte
+  "NCSAmult" name, decodes: a 6-byte member-type map, then `nseen*2*8` bytes
+  of address/EOA pairs (`nseen` = count of unique mapped values), then for
+  each unique value a NUL-terminated name TEMPLATE string, 8-byte aligned,
+  read straight from the file with NO validation of its content whatsoever:
+    memb_name[_unmapped] = (const char *)buf;   -- :809, just a pointer into buf
+  Stored via my_strdup into `file->fa.memb_name[mt]`, then `open_members(file)`
+  is called unconditionally (:857/889-925):
+    nchars = snprintf(tmp, sizeof(tmp), file->fa.memb_name[mt], file->name);  -- :1917
+  The attacker's raw decoded string is used DIRECTLY as snprintf's FORMAT
+  STRING, with exactly one vararg (`file->name`, the real file's own name).
+  H5FD_multi_delete (:1992) has the identical pattern. Both are wrapped in
+  H5_WARN_FORMAT_NONLITERAL_OFF/_ON -- the non-literal-format pattern is
+  KNOWN and deliberate to the HDF5 developers (it is how the feature's
+  legitimate "%s.meta"/"%s.raw" templates work), not an accidental oversight;
+  content validation is simply absent.
+  TWO CONSEQUENCES: (1) a template with MORE '%s' conversions than the one
+  supplied vararg reads whatever is in the next variadic-calling-convention
+  register/stack slot and dereferences it as a char* -- format-string OOB
+  read / crash (CWE-134). (2) a template with NO '%' at all is copied through
+  UNCHANGED, so the resulting member filename is entirely attacker-chosen,
+  ignoring `file->name` (the real file's path) completely -- path substitution
+  (CWE-73), bounded by H5FDopen's semantics (opens, does not create, when
+  H5F_ACC_CREAT isn't in the caller's flags).
+
+# -- Measured behaviour (2026-09-07) --------------------------------------
+measured:
+  build: >-
+    A genuine 2-member multi-driver file built via H5Pset_fapl_multi +
+    the candidate build's h5cc (not hand-crafted from scratch) -- SUPER
+    grouped separately from DRAW, default templates "%s.meta"/"%s.raw" (both
+    exactly 8-byte NUL-terminated fields once aligned, so same-length in-place
+    substitution needs no block resize or checksum work; this driver-info
+    block carries no separate checksum of its own).
+  blocker_in_first_attempt: >-
+    A naive same-length substitution on an ALREADY-unique member type (e.g.
+    DRAW, unique under both the file's on-disk map and the caller's own
+    bootstrap FAPL map) never reaches the vulnerable snprintf: open_members()
+    skips any type whose file->memb[mt] slot is already non-NULL, and
+    H5FD_multi_open's OWN bootstrap open_members() call (which runs BEFORE
+    sb_decode, using the CALLER's correct FAPL templates) already opens every
+    member unique under the caller's map. Confirmed via repeated gdb runs:
+    two hits at :1917, both from the bootstrap frame, never from
+    H5FD_multi_sb_decode's call.
+  working_construction: >-
+    Fixed by making the FAPL's map and the ON-DISK map disagree
+    self-consistently rather than adding a new entry. Both open_members'
+    read and sb_decode's write are indexed by the MAPPED value, but decode's
+    write into its local memb_addr[]/memb_name[] arrays is indexed by
+    first-occurrence type (`_unmapped`) -- the two only coincide when the new
+    unique target is SELF-MAPPED (map[X]==X). Changed 2 bytes in the on-disk
+    6-byte member map: map[H5FD_MEM_BTREE] 1->2 (self-maps BTREE into a brand
+    new unique group never opened at bootstrap), map[H5FD_MEM_DRAW] 3->1
+    (merges DRAW back into SUPER's group, holding `nseen` at 2 -- SAME total
+    file size, no length-field or address-section growth needed). Overwrote
+    the now-unused second name-template slot (originally "%s.raw\0\0") with
+    the malicious template. Recomputed the superblock-extension OH chunk0's
+    Jenkins-lookup3 checksum (self-checked against the original stored value
+    first -- matched exactly, confirming the byte offsets used).
+  crash: >-
+    Opened with H5Fopen using the SAME multi FAPL the file was created with.
+    An 8-byte "%s%s.mx\0" template (2 conversions, 1 vararg) did NOT crash --
+    the phantom second vararg register happened to hold 0, so glibc printed
+    "(null)". A THIRD %s ("%s%s%sX\0") consumed the NEXT register (a small
+    bogus nonzero value) and produced a clean SIGSEGV, gdb-confirmed firing
+    from H5FD_multi_sb_decode's OWN open_members() call (H5FDmulti.c:857),
+    not the bootstrap frame:
+      AddressSanitizer: SEGV on unknown address 0x000000000508
+      #3 snprintf
+      #4 open_members            H5FDmulti.c:1917
+      #5 H5FD_multi_sb_decode    H5FDmulti.c:857
+      #6 H5FD__sb_decode / H5FD_sb_load   H5FD.c:660/700
+      #7 H5F__super_read         H5Fsuper.c:681
+      ...
+      #14 H5Fopen                H5F.c:820
+  path_substitution_variant: >-
+    A literal 7-character no-'%' template ("XXXXXXX") confirmed at the
+    tmp-buffer level: the vulnerable call executes with tmp/nchars=7 matching
+    the literal exactly, ignoring file->name entirely. NOT independently
+    confirmed at the filesystem/syscall level in the time available --
+    relax=1 + read-only tolerates the resulting H5FDopen failure silently, so
+    H5Fopen still succeeds overall; a strace-level confirmation that
+    H5FDopen actually issues open()/openat() on the literal string is the
+    remaining step.
+  h5policy: >-
+    unsupported_coverage_gap on the crafted specimen -- confirmed NOT a
+    scoped miss: h5policy does not model multi-driver member files at all, so
+    there is no invariant this record could have caught and didn't.
+  reachability_correction: >-
+    CORRECTS an earlier, more optimistic read. HDF5_DRIVER=multi with a
+    completely default H5Fopen(path, RDONLY, H5P_DEFAULT) (no explicit FAPL
+    driver selection) does NOT reach decode on this specimen -- it fails
+    outright ("Can't open object"), because the env var alone does not
+    reconstruct a matching member map/name-template FAPL. The realistic
+    trigger requires the VICTIM APPLICATION to already explicitly call
+    H5Pset_fapl_multi / H5Pset_fapl_split with a member map compatible enough
+    for H5Fopen to get as far as decode -- narrower than "any process that
+    opens any file with one env var set."
+
+# -- Divergence from the selected build -----------------------------------
+divergence:
+  oracle: unsupported_coverage_gap (no model exists, not a refusal-by-design)
+  libhdf5: SIGSEGV (format-string variant); silent path substitution (literal variant, filesystem-level unconfirmed)
+  libhdf5_version: 2.3.0
+  classification: >-
+    An oracle FALSE NEGATIVE by total absence, not by a narrow miss -- there
+    is no h5policy invariant over multi/split member maps or name templates
+    to have caught this, in either direction.
+  reachability_correction: see measured.reachability_correction above.
+
+# -- Containment vs systemic remediation -----------------------------------
+containment:
+  status: none
+  description: >-
+    libhdf5: validate the decoded name template before storing it -- at
+    minimum, reject any template whose '%' count exceeds 1 (the single
+    vararg the callers ever supply), and consider rejecting '%' entirely for
+    templates that arrive from an untrusted driver-info block versus ones set
+    programmatically via H5Pset_fapl_multi's own memb_name argument (the
+    trust boundary is the DECODE path, src/H5FDmulti.c:809, not the
+    struct field itself, which is also used for legitimate in-process
+    templates).
+    h5policy: no containment exists. Modeling the multi/split VFD's member
+    structure (map, address/EOA pairs, name templates) is new work, not a
+    fix to an existing validator.
+systemic:
+  semantic_boundary: >-
+    a driver-info block's member-type map decides, at DECODE TIME, which
+    array slots libhdf5 treats as "not yet opened" -- and that decision can
+    disagree with the CALLER's own FAPL-supplied map in a way that routes
+    attacker-controlled data (the on-disk name template) to a code path
+    (open_members) the caller's own trusted templates never reach for that
+    slot. This is the same class of trust-boundary confusion as
+    lheap-dblk-addr-alias's cache-hit-skips-deserialize shape: which data
+    reaches which slot depends on decode-time state, not on validation.
+  status: open
+  owner: unassigned
+
+# -- Reproducers ------------------------------------------------------------
+reproducers:
+  integration_poc: none tracked, deliberately -- rebuildable from the recipe below.
+  generator: >-
+    RECIPE, verified 2026-09-07.
+      1. Build a genuine 2-member multi-driver file via H5Pset_fapl_multi +
+         H5Fcreate (a small C program linked against h5cc; h5py has no
+         multi-driver support).
+      2. Locate the driver-info block (search for the "NCSAmult" 8-byte name)
+         and its 6-byte member-type map immediately following the 16-byte
+         driver-info header.
+      3. Change two map bytes so a previously-non-unique type becomes
+         SELF-MAPPED (map[X]=X) to a brand-new unique group never opened by
+         H5FD_multi_open's bootstrap call, while merging some other type into
+         an existing group to keep the total unique count (and therefore the
+         block's size) unchanged -- avoids any resize/checksum-of-length
+         surgery.
+      4. Overwrite the now-freed name-template slot with the malicious
+         template (same length as the original, in place): 3+ '%s'
+         conversions for the crash variant, a plain literal for the
+         path-substitution variant.
+      5. Recompute the superblock-extension OH chunk0 checksum (Jenkins
+         lookup3) if the driver-info block lives inside a checksummed chunk.
+      6. H5Fopen with the SAME multi FAPL the file was created with (this is
+         required -- see measured.reachability_correction).
+    MUST BE OBSERVED with a caller-selected multi/split FAPL; the env-var
+    HDF5_DRIVER shortcut does not by itself reconstruct a compatible map.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: unverified   # the literal-template variant's filesystem-level open is unconfirmed
+    no_user_callback: true
+    no_legacy_fallback: true
+
+backports: []
+
+fuzz_seed: >-
+  n/a -- requires a self-consistent member-map mismatch between the FAPL and
+  the on-disk driver-info block, which a byte-mutation fuzzer over a single
+  well-formed multi file is very unlikely to construct (most mutations of the
+  map bytes make H5FD_multi_open fail outright before decode, as the first
+  attempt at this reproduction also found).
+
+sibling_audit: >-
+  registry/cases/driver-info-block-fields-unbounded.yml is the only existing
+  case touching the driver-info block, and it covers a completely different
+  mechanism (the block's own address/length fields unboundedly extending the
+  EOA). It does not model member maps or name templates at all, confirming
+  this record is new ground, not a variant of that one.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range. Measured at 2.3.0. H5_WARN_FORMAT_NONLITERAL_OFF/_ON
+    wrapping the snprintf calls suggests this pattern is long-standing and
+    known-non-literal to the developers; not bisected.
+  label: one point, not a range
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    THE LITERAL (no-'%') PATH-SUBSTITUTION VARIANT IS UNCONFIRMED AT THE
+    FILESYSTEM LEVEL. Proven at the tmp-buffer level (snprintf's output
+    matches the literal exactly); a strace-level confirmation that H5FDopen
+    issues open()/openat() on that literal path, and what happens when the
+    caller's flags include H5F_ACC_RDWR (potential attacker-directed file
+    creation/open, mirroring the EFL/VDS write-cascade cases), is not done.
+  - >-
+    h5policy HAS ZERO MODEL of the multi/split VFD. Closing this properly
+    needs new pickle work (decode the member map, address/EOA pairs and name
+    templates from the driver-info block), not a patch to an existing
+    validator -- scope it as a new record family, not a fix.
+  - No 32-bit measurement.
+  - >-
+    Whether the format-string crash variant can be escalated beyond a
+    read-and-crash (e.g. a %n-style write, if any variadic slot happens to
+    hold a writable pointer) is unexplored -- only a %s over-read was tried.
+
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working note; see the same field in
+# registry/cases/local-heap-free-list-bound-wraps.yml for why. NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    The Multi and Split VFDs decode a per-member-file name template from the
+    file's own driver-info block with no validation, and two call sites pass
+    it directly to snprintf as the FORMAT STRING with only one vararg
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: unverified as a range; present at 2.3.0
+    patched_versions: none
+  vulnerable_functions: >-
+    H5FD_multi_sb_decode (src/H5FDmulti.c:745-873, the unvalidated decode);
+    open_members (src/H5FDmulti.c:1917) and H5FD_multi_delete
+    (src/H5FDmulti.c:1992), both the snprintf sinks. Reachable from H5Fopen
+    when the caller has selected the Multi or Split VFD with a member map
+    that at least partially matches the file's own on-disk map.
+  severity: Medium
+  cvss: "CVSS:3.1/AV:L/AC:H/PR:N/UI:R/S:U/C:N/I:N/A:H (base 5.9)"
+  cvss_rationale: >-
+    A crash (format-string over-read dereferencing a phantom vararg) is
+    demonstrated and reliable once the map-mismatch precondition is met;
+    AC:H reflects that precondition (caller must already select the
+    multi/split driver, and the on-disk map must disagree with the FAPL's own
+    map in a specific self-mapped way). The path-substitution half's impact
+    (whether it reaches an actual unauthorized file open/create) is
+    unconfirmed at the filesystem level, so C/I are left at None pending that
+    confirmation rather than assumed.
+  weaknesses: >-
+    CWE-134 (use of externally-controlled format string); CWE-73 (external
+    control of file name or path, for the no-'%' literal-template variant);
+    CWE-20 (the root cause -- no validation of the decoded template at all).
+  workarounds: >-
+    Do not select the Multi or Split VFD for files supplied by another party.
+    h5policy (a local validation layer, not part of upstream HDF5) rejects
+    these files as unsupported_coverage_gap, since it does not model the
+    multi/split VFD's member structure at all -- a conservative refusal, not
+    a targeted defense.
+
+provenance:
+  found_by: >-
+    local analysis, triaging an externally-supplied report; the report named
+    the mechanism and sink correctly, the working end-to-end crash
+    construction (map self-mapping to bypass the bootstrap-open ordering) was
+    derived locally
+  h5policy_commit: "branch updates/20260903, at 954882254293"
+  libhdf5_source: {branch: patch/20260903, commit: b5865e78549a, version: 2.3.0}
+  baseline_build: {version: 2.3.0, build_mode: RelWithDebInfo, sanitizers: []}
+  asan_build: {build_mode: RelWithDebInfo, sanitizers: [address], ndebug: true}  # workstation-local install; path not recorded
+  input_note: >-
+    Specimens and build/patch scripts are not tracked; left in the scratchpad
+    this session produced them in (patch_map_mismatch.py,
+    mapmix_3percent.h5.{meta,raw}, mapmix_literal.h5.{meta,raw},
+    open_same_fapl.c, default_open.c).

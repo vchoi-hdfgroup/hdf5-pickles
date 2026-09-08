@@ -1,0 +1,210 @@
+# A virtual dataset's source-file name is resolved exactly like an external
+# link's, by the same shared function, and inherits the same defect this
+# repo already tracks for that sibling (efl-absolute-target-path-arbitrary-read
+# names it directly in its own "systemic" section):
+#
+#   src/H5Fint.c:884   if (H5_CHECK_ABSOLUTE(file_name) || H5_CHECK_ABS_PATH(file_name))
+#                      {  /* try opening the stored name FIRST */
+#   src/H5Fint.c:919       if (src_file == NULL) { ... prefix fallback ... }
+#
+# H5Pset_virtual_prefix / HDF5_VDS_PREFIX / ${ORIGIN} are containments that
+# only ever run AFTER the attacker's own absolute (or parent-relative) name has
+# already been tried and has already failed to open. A name that resolves
+# succeeds before the prefix is ever consulted.
+#
+# VDS adds a second half EFL does not have: the resolved source file is opened
+# with the PARENT file's own inherited access intent --
+#
+#   src/H5Dvirtual.c:1407   intent = H5F_INTENT(vdset->oloc.file);
+#
+# -- so a victim who opens the VDS file H5F_ACC_RDWR (the ordinary case for any
+# application that both reads and writes its own files) and then H5Dwrites into
+# the virtual dataset mutates the resolved external file'S dataset IN PLACE.
+# EFL has no analogous write-cascade recorded because its write direction
+# (O_CREAT | O_RDWR) is flagged there as unwitnessed on the oracle side; here it
+# is directly measured.
+#
+# Nothing here is malformed. H5Pset_virtual/H5Pset_virtual_prefix are documented
+# public API and the specimen is a valid HDF5 file libhdf5's own writer could
+# have produced. That is why this is a POLICY case, like its EFL sibling, and
+# closes with no oracle change.
+schema_version: 1
+
+id: vds-source-path-uncontained-write-cascade
+title: a virtual dataset's absolute (or parent-relative) source path is opened
+  before H5Pset_virtual_prefix/HDF5_VDS_PREFIX ever runs, and the resolved
+  source is opened with the VDS file's own inherited intent -- so H5Dwrite on
+  the virtual dataset mutates an attacker-named external file in place
+status: oracle-covered            # pre-existing policy denial + path classification; libhdf5 unfixed by design
+disclosure: >-
+  n/a -- local analysis only. No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up. Re-derived and measured
+  locally against the current source tree; not from any external report.
+
+record: virtual_dataset
+versions: [4]                     # layout message v4; VDS global-heap mapping block v0
+root_cause_classification: premature_activation
+violated_invariant:
+  - vds.no_source_open
+  - vds.source_path_classified
+validation_closure: >-
+  the VDS layout message and its global-heap-resident mapping block, each
+  mapping's source-file name decoded and classified as absolute,
+  parent-relative or relative -- never resolved and never opened.
+activation_before_validation:
+  - external_open                 # H5F_prefix_open_file's absolute-first try, src/H5Fint.c:884
+  - data_read                     # the resolved file's bytes become dataset element values
+  - data_write                    # H5Dwrite on the virtual dataset reaches the resolved file
+entry_points:
+  - "h5policy (oracle) -- reject_policy (H5_POLICY_VDS) under untrusted-strict and forensic; accept_with_warnings (H5_ADVISORY_VDS_ABSOLUTE_SOURCE / _PARENT_SOURCE / _RELATIVE_SOURCE) under trusted-fast and legacy. Opens nothing under any profile."
+  - "libhdf5 -- H5Dread/H5Dwrite -> H5D__virtual_pre_io -> H5D__virtual_open_source_dset -> H5F_prefix_open_file (src/H5Fint.c:884-919) -> intent inherited at src/H5Dvirtual.c:1407"
+  - "direct consumer: any application that opens the VDS file H5F_ACC_RDWR and reads or writes the virtual dataset"
+
+defect: >-
+  LIBHDF5 SIDE, and it is the same design decision as the EFL sibling: the VDS
+  source name is an unconstrained path, resolved at open time against the
+  reading process's filesystem and credentials, with the configured prefix
+  running only as a fallback. VDS narrows the primitive relative to EFL in one
+  direction (H5F_prefix_open_file opens-and-does-not-create, so the target
+  dataset must already exist inside a valid HDF5 file -- no arbitrary-file-write
+  the way EFL's O_CREAT path allows) and widens it in another: EFL has no
+  write-cascade measured at all, while VDS's inherited-intent write is directly
+  confirmed here.
+  ORACLE SIDE: no defect, and no change made. h5policy already denies the VDS
+  feature outright under the untrusted profiles (vds.no_source_open) and, where
+  a profile permits it, classifies the decoded name as absolute, parent-relative
+  or relative without resolving it (vds.source_path_classified). The declared
+  boundary does the rest.
+
+containment:
+  libhdf5: >-
+    H5Pset_virtual_prefix / HDF5_VDS_PREFIX / ${ORIGIN} exist and are inert
+    against an absolute or parent-relative name for exactly the reason the EFL
+    record gives for its own prefix knobs: the branch that honours the prefix
+    is the failure arm of a test on the attacker's own stored name. No property
+    disables VDS source resolution outright.
+  h5policy: >-
+    The feature gate. untrusted-strict and forensic both reject_policy on the
+    VDS layout itself before any mapping's source name is even classified.
+    trusted-fast and legacy classify the name (absolute / parent / relative)
+    without resolving it. A path allow-list is deliberately not modelled, for
+    the same reason as EFL: the oracle has no notion of the consumer's
+    filesystem.
+
+measured: >-
+  2026-09-07, fresh specimens (original bundle `cases/091b698d72d0a05c4c9222f06e82b680`
+  from 2026-09-01 is gone -- swept). Built under scratchpad `vds_demo/`:
+  `decoy_dir/source.h5` (dataset `d` = [1,2,3,4]), `attacker_dir/source.h5`
+  (dataset `d` = [9,9,9,9], same shape/dtype, different directory),
+  `vds_source.h5` (virtual dataset `vd`, VirtualSource an ABSOLUTE path to
+  attacker_dir/source.h5).
+  READ-SUBSTITUTION: with HDF5_VDS_PREFIX=decoy_dir set, reading `vd` returns
+  [9,9,9,9] -- the attacker's absolute path wins over the prefix.
+  CONTROL: moved attacker_dir/source.h5 aside, reread the same vds_source.h5 --
+  got [1,2,3,4] (the decoy), proving the prefix mechanism is functional and
+  merely second in line, not broken.
+  WRITE-CASCADE: restored the attacker file, opened vds_source.h5 `r+`, wrote
+  [7,7,7,7] into `vd`, closed. Reopened attacker_dir/source.h5 DIRECTLY (not
+  through the VDS) -- its `d` dataset now reads [7,7,7,7], confirming in-place
+  mutation of the resolved external file via the virtual dataset.
+  PARENT-RELATIVE (closes the prior "still unmeasured" follow-up): built
+  relroot/nested/vds_rel.h5 with VirtualSource("../outside_target.h5", ...);
+  read from an unrelated CWD with no prefix set -- resolved correctly to
+  relroot/outside_target.h5 ([42,42,42,42]), confirming a `..`-relative source
+  escapes upward exactly like the EFL sibling, resolved against the VDS file's
+  own directory.
+  h5policy, re-verified on the fresh specimen: untrusted-strict rejects as
+  H5_POLICY_VDS (offset 269); trusted-fast accepts with
+  H5_ADVISORY_VDS_ABSOLUTE_SOURCE and still opens nothing. Neither profile can
+  or does discriminate decoy-vs-attacker content -- confirms this remains a
+  documented-behavior/policy question, not a memory-safety oracle gap.
+  Source citations re-verified against the current tree, unchanged from the
+  original 2026-09-01 measurement: H5F_prefix_open_file absolute-path check at
+  src/H5Fint.c:884, prefix-fallback branch at :919; intent inheritance at
+  src/H5Dvirtual.c:1407.
+
+systemic: >-
+  See efl-absolute-target-path-arbitrary-read's own "systemic" note, which
+  already names this record before it existed: EFL, external links and VDS all
+  take an attacker-controlled name through H5F_prefix_open_file (VDS, external
+  links) or H5_combine_path (EFL) -- two different functions, the same
+  absolute-wins-first shape, the same documented-behaviour classification. This
+  record is the VDS half of that triad actually measured end to end, including
+  the write direction EFL's own record left unwitnessed.
+
+coverage_gaps:
+  - >-
+    THE WRITE-DIRECTION PRIMITIVE HAS NO REGRESSION FIXTURE. This oracle and its
+    differential are read-only by construction (same limitation the EFL record
+    states for its own write half), so there is no tracked fixture exercising
+    H5Dwrite through a VDS mapping; the measurement above is the only local
+    evidence.
+  - >-
+    NO FIXTURE ASSERTS ANY OF THE THREE VDS PATH-CLASS ADVISORIES. Unlike EFL,
+    which pins two of its three classifications in the corpus, this repo has no
+    valid/policy fixture for H5_ADVISORY_VDS_ABSOLUTE_SOURCE,
+    _PARENT_SOURCE or _RELATIVE_SOURCE at all -- a regression that misclassified
+    one as another would pass the suite silently.
+  - >-
+    WHETHER A FAILED VDS RESOLUTION IS DISTINGUISHABLE FROM A ZERO-FILLED
+    SOURCE remains as stated in the original memory: H5Dread returns 0 with
+    fill values on an absent source, and nothing in the file's own metadata
+    marks which mappings are expected to resolve.
+
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working note; see the same field in
+# registry/cases/local-heap-free-list-bound-wraps.yml for why. NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    A virtual dataset's absolute or parent-relative source path is opened
+    before any configured prefix/containment ever runs, and the resolved
+    source is opened with the VDS file's own inherited access intent, so an
+    ordinary H5Dwrite mutates an attacker-named external file in place
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: unverified as a range
+    patched_versions: >-
+      none identified; this reads as a deliberate design choice (the code
+      carries a comment pointing at the format's own reference manual)
+      rather than an oversight, so a fix is a policy decision rather than an
+      obvious patch
+  vulnerable_functions: >-
+    H5F_prefix_open_file (src/H5Fint.c:884-919, the absolute-path-first
+    ordering) and H5D__virtual_open_source_dset (src/H5Dvirtual.c:1407, the
+    inherited-intent open). Public entry points: H5Dread/H5Dwrite on a
+    virtual dataset whose source name is absolute or parent-relative.
+  severity: Medium
+  cvss: "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N (base 7.1)"
+  cvss_rationale: >-
+    Not memory corruption -- a design/containment gap. The write primitive
+    is real and measured (a decoy/control pair proves the prefix mechanism
+    is genuinely bypassed, not merely absent), but bounded: the resolver
+    opens rather than creates, so the target dataset must already exist
+    inside a file the process can open for writing. I:H reflects an
+    unauthenticated write to that target; C:L reflects that reading a VDS
+    dataset can also disclose whichever file actually resolves, which the
+    application does not control.
+  weaknesses: >-
+    CWE-668 (exposure of a resource to a wrong sphere -- the resolved file
+    is outside anything the application named); CWE-706 (use of
+    incorrectly-resolved name -- the prefix containment runs only as a
+    fallback, after the attacker's own name has already been tried).
+  workarounds: >-
+    Do not open, for writing, a file containing virtual datasets from an
+    untrusted source. There is no supported way to force VDS source
+    resolution to stay under a configured directory -- today's prefix is a
+    fallback, not a containment.
+
+provenance:
+  found_by: >-
+    local analysis, closing a gap both EFL bundles at the time flagged as open
+    ("does VDS have the same hole?"); re-measured fresh for promotion, no
+    external report involved
+  h5policy_commit: "branch updates/20260903, at 954882254293"
+  libhdf5_source: {branch: patch/20260903, commit: b5865e78549a, version: 2.3.0}
+  baseline_build: {version: 2.3.0, build_mode: RelWithDebInfo, sanitizers: []}

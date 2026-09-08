@@ -1,0 +1,290 @@
+# The scale-offset filter's FULL-PRECISION fast path skips the bound its own
+# sibling slow path fifteen-odd lines below applies. Third member of a family
+# already tracked twice over (see sibling_audit): fletcher32
+# (filtered-chunk-zero-stored-size.yml) and szip (szip-decompress-length-and-alloc.yml)
+# each read a size from data the caller controls and use it before checking it
+# against what is actually available; scale-offset's version of the same shape
+# was NOT predicted by either sibling record and needed its own find.
+#
+# Found 2026-08-29 as a gitignored bundle (cases/a540b656a2e7ba322066385d438cd008,
+# swept before promotion); re-derived and re-measured from scratch on 2026-09-07
+# for this record, rather than trusting the stale bundle's sha256/line numbers.
+# Nothing drifted: same function, same line, same mechanism.
+schema_version: 1
+
+id: scaleoffset-fastpath-memcpy-oob
+title: H5Z__filter_scaleoffset's full-precision fast path memcpy's
+  d_nelmts*element_size bytes out of the chunk buffer with no check against
+  the buffer's real size, unlike its own slow-path sibling fifteen lines down
+status: oracle-hardened          # h5policy already rejects every specimen that could reach this; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only. No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: dataset_layout_filter_fill
+versions: [2, 3, 4]               # filter-pipeline message versions carrying scale-offset (id 6)
+root_cause_classification: local_decode
+violated_invariant:
+  - layout.filter_element_count   # already closes it -- see measured.oracle
+validation_closure: >-
+  one chunk-index record's declared element count (cd_values[2]) against the
+  real chunk's element count, the same closure fletcher32 and szip's arm 1
+  already use for their own size fields. h5policy applies it to scale-offset
+  and n-bit alike (both filters share the cd_values[2]/[4] convention), so
+  every specimen that could reach the vulnerable memcpy is rejected before
+  libhdf5 ever sees it.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - "h5policy (oracle) -- reject_corrupt, H5_CORRUPT_FILTER_NELMTS_MISMATCH, under untrusted-strict (and every other profile that checks layout.filter_element_count)"
+  - "libhdf5 H5Dread -> H5D__chunk_lock -> H5Z_pipeline -> H5Z__filter_scaleoffset (src/H5Zscaleoffset.c:1240-1248)"
+  - "shipped consumers: h5dump with data (h5dump -d), any H5Dread. NOT h5dump -H."
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  H5Z__filter_scaleoffset's decompress branch does, in order:
+    size_out = d_nelmts * (size_t)p.size;             -- :1240, cd_values[2] * cd_values[4]
+    outbuf   = H5MM_malloc(size_out);                  -- :1243, unchecked allocation, dest is fine
+    if (minbits == p.size * 8)                         -- :1247, FULL-PRECISION fast path
+        H5MM_memcpy(outbuf, (*buf) + buf_offset, size_out);   -- :1248, THE OOB READ
+    else
+        H5Z__scaleoffset_decompress(outbuf, d_nelmts, (*buf) + buf_offset,
+                                    *buf_size - buf_offset, p);  -- SAFE: bounds against *buf_size
+  The fast path skips the bound its own sibling applies two branches down.
+  `*buf_size` is in scope at :1248 and simply unused. The destination is fine
+  (correctly sized from size_out); the SOURCE is the chunk, and nothing checks
+  that `size_out` bytes are actually present in it.
+  BOTH HALVES OF THE TRIGGER ARE IN THE FILE: `minbits` comes from the chunk's
+  own first 4 bytes (:1211-1218, checked only `<= p.size*8`, never compared to
+  anything the pipeline knows); the count is cd_values[2]. The crash needs BOTH
+  fields moved together -- inflating the count alone (leaving minbits
+  untouched, so the slow, bounds-checked path runs) returns a clean rc=1. A
+  one-field-at-a-time mutator never finds this, which is presumably why it
+  needed a dedicated find rather than falling out of the fletcher32/szip work.
+
+# -- Measured behaviour (re-derived fresh, 2026-09-07) -------------------------
+measured:
+  base_fixture: >-
+    h5py, libver=('v110','v110'), dataset `d` shape (2,2) dtype i4, chunks
+    (2,2), scaleoffset=0, data [[INT32_MIN, INT32_MAX],[0,1]] -- spans the
+    full range of the type so minbits=32=p.size*8 (the fast-path
+    precondition), confirmed from the raw chunk's first 4 bytes (`20000000`
+    LE = 32) and from cd_values via get_filter(0): index 2 (nelmts) = 4,
+    index 4 (element size) = 4 -- both match the real 2x2 chunk exactly.
+  patch: >-
+    v2 filter-pipeline OH message (type 0x0b, version 2, 1 filter, id 6)
+    located at OHDR offset 195 by the same byte-locator
+    h5policy-gencorpus's `_scaleoffset_cd_patch` uses. cd_values[2]
+    (message offset +8+4*2) rewritten 4 -> 1024 and, as a second variant,
+    4 -> 65536; v2 OH checksum resealed with the same Jenkins lookup3
+    gencorpus's `_fix_v2_ohdr_checksum` uses. Two variants built, not
+    committed (specimens produced by a scratch patcher, matching this
+    repo's convention for unpromoted bundles):
+      nelmts=1024:  base sha256 e75655ba...83fc9, mutant sha256 d68a10ed...0ba24
+      nelmts=65536: mutant sha256 6de16384...870bd1
+  oracle: >-
+    h5policy --profile untrusted-strict, BOTH variants: reject_corrupt,
+    H5_CORRUPT_FILTER_NELMTS_MISMATCH, actual 1024 (or 65536), expected 4.
+    Confirms the oracle is sound: this specific specimen shape -- the only
+    shape that reaches the vulnerable memcpy -- is already rejected, so this
+    is a libhdf5-only finding with no h5policy gap to close.
+  asan: >-
+    the candidate build (RelWithDebInfo, ASan, -DNDEBUG retained so the
+    fast path's own asserts don't mask it -- see assert-shadows-asan-witness).
+    `h5dump -d /d <file>`, BOTH variants: rc=134 (SIGABRT), identical trace:
+      heap-buffer-overflow READ of size 4096 at 0x504000002475
+      #0 memcpy
+      #1 H5Z__filter_scaleoffset  src/H5Zscaleoffset.c:1248
+      #2 H5Z_pipeline             src/H5Z.c:1467
+      #3 H5D__chunk_lock          src/H5Dchunk.c:4850
+    (4096 = 1024*4, confirming size_out = d_nelmts*p.size is exactly the
+    inflated value, read straight out of a 37-byte real chunk allocation from
+    H5D__chunk_mem_alloc.)
+  stock_release: >-
+    the baseline build (Release, non-ASan, h5dump 2.3.0). nelmts=1024: rc=1, clean
+    "h5dump error: unable to print data" -- allocator luck, not a guard; the
+    ASan trace above proves the same file is unsafe. nelmts=65536: rc=139,
+    hard SIGSEGV. Matches the size-dependent split already on record in
+    memory exactly. WORTH CARRYING: the clean-looking rc=1 at the smaller
+    size is exactly the trap the fletcher32/szip siblings also warn about --
+    a Release rc=1 is not evidence of a guard.
+  width: 64-bit only; no 32-bit measurement.
+  disclosure_primitive: >-
+    NOT FOUND. The over-read lands in outbuf, which becomes the dataset's
+    data -- but the pipeline's downstream size check refuses the oversized
+    result before it reaches a caller. Open question, not an impact claim.
+
+# -- Divergence from the selected build -----------------------------------
+divergence:
+  oracle: reject_corrupt (H5_CORRUPT_FILTER_NELMTS_MISMATCH)
+  libhdf5: heap-buffer-overflow READ under ASan; SIGSEGV on stock Release at
+    larger nelmts
+  libhdf5_version: 2.3.0
+  classification: >-
+    Agreement, no divergence to carry: h5policy rejects the only specimen
+    shape that reaches the defect, and libhdf5 is unsafe on it. No tolerance
+    or A~ predicate needed.
+  note: >-
+    No malformed/ fixture is added and none is needed for THIS record: the
+    existing malformed/scaleoffset_nelmts_mismatch.h5 already pins
+    H5_CORRUPT_FILTER_NELMTS_MISMATCH on the identical field
+    (cd_values[2] inflated), so a scale-offset-specific regression fixture
+    would test the same oracle clause a second time. What that existing
+    fixture does NOT carry is the minbits==size*8 co-condition needed to
+    reach the memcpy itself -- see coverage_gaps.
+
+# -- Containment vs systemic remediation ---------------------------------
+containment:
+  status: oracle_only
+  description: >-
+    libhdf5: `if (size_out > *buf_size - buf_offset) HGOTO_ERROR(...)` before
+    :1248, the same shape as the slow path's own bound one branch down.
+    Bounding the malloc alone fixes nothing -- the over-read is from the
+    SOURCE, not the destination.
+    h5policy: already covers the only reachable specimen shape via
+    layout.filter_element_count. No change needed.
+systemic:
+  semantic_boundary: >-
+    the filter pipeline's input contract -- identical to the szip sibling's
+    framing. A filter that reads an element count from its own cd_values must
+    establish that count against the buffer it was actually handed before
+    using it to size a copy.
+  status: open
+  owner: unassigned
+  description: >-
+    `grep -n 'if (nbytes' src/H5Z*.c` still returns nothing (per the szip
+    record); scale-offset is the third filter measured with this shape and
+    the szip record's sibling_audit did not predict it, so the family is
+    larger than either prior record assumed.
+  landed_changes: []
+
+# -- Reproducers ----------------------------------------------------------
+reproducers:
+  integration_poc: none tracked, deliberately -- rebuildable from the recipe below.
+  generator: >-
+    RECIPE, verified 2026-09-07.
+      1. h5py, libver=('v110','v110'): int32 dataset, chunks equal to the full
+         array, scaleoffset=0, data spanning [INT32_MIN, INT32_MAX] in the
+         SAME chunk -- forces minbits=32=p.size*8 (the fast-path
+         precondition). Confirm via the chunk's own first 4 bytes.
+      2. Locate the v2 filter-pipeline OH message (same byte-locator
+         h5policy-gencorpus's `_scaleoffset_cd_patch` uses).
+      3. Overwrite cd_values[2] (the declared chunk element count) with a
+         value larger than the real element count -- 1024 gives a clean ASan
+         catch, 65536+ gives a hard stock-build SIGSEGV.
+      4. Reseal the v2 OH checksum (Jenkins lookup3, same as gencorpus's
+         `_fix_v2_ohdr_checksum`).
+    MUST BE OBSERVED UNDER ASan+NDEBUG. The stock Release build returns a
+    clean rc=1 at small inflation values and looks safe; it is not.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: false      # the fault is INSIDE the filter's decompress branch
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: false
+
+backports: []
+
+fuzz_seed: >-
+  Needs TWO fields moved together (cd_values[2] AND the chunk's own minbits
+  byte), which is exactly why a one-field-at-a-time metadata mutator never
+  finds it -- the existing malformed/scaleoffset_nelmts_mismatch.h5 moves only
+  the count and returns a clean rejection without ever reaching the memcpy.
+
+compatibility_backport_risks: >-
+  None. A conforming scale-offset chunk's cd_values[2] always equals its real
+  element count, by construction of any writer that could produce it; the
+  floor this needs is unreachable for anything libhdf5 itself wrote.
+
+sibling_audit: >-
+  THIRD MEMBER of a family, and NOT predicted by either prior record:
+  fletcher32 (filtered-chunk-zero-stored-size.yml, chunk.stored_size) and szip
+  (szip-decompress-length-and-alloc.yml, this record's closest sibling in
+  shape and in write-up structure). The szip record's own sibling_audit does
+  not mention scale-offset. STILL UNAUDITED: n-bit (filter id 5) shares the
+  identical cd_values[2]/[4] convention and code path
+  (filter-nelmts-guard-workflow / filter-local-parms-vs-source-messages) but
+  was not independently checked for this SAME fast-path-skips-slow-path shape.
+
+# -- Affected versions ------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range. Measured at 2.3.0. The fast path's missing bound is
+    an absence rather than a defective check, so presumably long-standing;
+    1.14.x and 1.10.x not audited.
+  label: one point, not a range
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    NO FIXTURE ASSERTS THE minbits==size*8 CO-CONDITION. The existing
+    malformed/scaleoffset_nelmts_mismatch.h5 pins the count-mismatch rejection
+    alone; a fixture combining both fields (which is what actually reaches
+    the vulnerable memcpy) is untracked, so a regression that weakened
+    layout.filter_element_count specifically for the full-precision case
+    would not be caught by the corpus.
+  - No 32-bit measurement.
+  - >-
+    NO DISCLOSURE PRIMITIVE IDENTIFIED. The over-read lands in outbuf, which
+    becomes dataset data, but the pipeline's downstream size check refuses
+    the oversized result before any caller sees it. Whether a differently
+    shaped specimen could make the oversized result survive that check is
+    unexplored.
+  - >-
+    n-bit (filter 5) not independently checked for this exact fast-path
+    shape -- see sibling_audit.
+
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working note; see the same field in
+# registry/cases/local-heap-free-list-bound-wraps.yml for why. NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    The scale-offset filter's full-precision fast path memcpy's an
+    attacker-declared element count out of the chunk buffer with no check
+    against the buffer's real size, unlike its own bounds-checked slow-path
+    sibling fifteen lines below
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: unverified as a range; present at 2.3.0
+    patched_versions: none
+  vulnerable_functions: >-
+    H5Z__filter_scaleoffset (src/H5Zscaleoffset.c:1240-1248). Public entry
+    points: H5Dread on a chunked, scale-offset-filtered dataset whose chunk's
+    declared element count (cd_values[2]) exceeds its real element count
+    while the chunk's own minbits equals the full type width -- e.g. h5dump
+    -d, or any application that reads such a dataset.
+  severity: Medium
+  cvss: "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:H (base 6.3)"
+  cvss_rationale: >-
+    A heap out-of-bounds READ is demonstrated and reliable (ASan) with a
+    hard crash on a plain, non-sanitized build at larger inflation values.
+    C:L reflects that the over-read lands in a buffer that becomes dataset
+    output, but a downstream size check in the pipeline refused the
+    oversized result on every build I tried -- I looked for and did not find
+    a disclosure primitive, so I am not claiming one.
+  weaknesses: >-
+    CWE-125 (the out-of-bounds read); CWE-20 (the root cause -- the fast
+    path never validates the declared element count against the buffer it
+    was actually handed, unlike its own slow-path sibling).
+  workarounds: >-
+    Validate a scale-offset filter's declared element count against the
+    dataset's real chunk element count before reading -- a local validation
+    layer of mine already does this independently and rejects every
+    specimen that could reach this memcpy, so the gap is libhdf5-only.
+
+provenance:
+  found_by: >-
+    local analysis, 2026-08-29 (original bundle, swept before promotion);
+    re-derived and re-measured fresh, 2026-09-07, for this record
+  h5policy_commit: "branch updates/20260903, at 954882254293"
+  libhdf5_source: {branch: patch/20260903, commit: b5865e78549a, version: 2.3.0}
+  baseline_build: {version: 2.3.0, build_mode: RelWithDebInfo, sanitizers: []}
+  asan_build: {build_mode: RelWithDebInfo, sanitizers: [address], ndebug: true}  # workstation-local install; path not recorded
