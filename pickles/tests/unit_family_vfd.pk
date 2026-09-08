@@ -52,7 +52,7 @@ expect_family("percent_specifier_other_than_d_is_rejected", rejected_bad_spec);
 
 fun make_member = (string path, byte pattern, int count) void:
 {
-    var ios = open(path, IOS_F_CREATE | IOS_F_TRUNCATE | IOS_F_WRITE | IOS_F_READ);
+    var ios = open_fresh(path);
     var data = byte[count]();
     var i = 0;
     while (i < count) {
@@ -74,14 +74,18 @@ fun bytes_all_equal = (byte[] b, byte v) int:
     return ok;
 }
 
+/* Members 0 and 1 are both interior (member 2 follows), so both must
+ * equal memb_size (= member 0's real size, 10 bytes) -- matching real
+ * HDF5's fixed-stride addressing (H5FDfamily.c: u = addr / memb_size).
+ * Member 2 is last, so it's allowed to be shorter. */
 make_member("family_vfd_regress-00000.h5", 0xAAUB, 10);
-make_member("family_vfd_regress-00001.h5", 0xBBUB, 6);
-make_member("family_vfd_regress-00002.h5", 0xCCUB, 14);
+make_member("family_vfd_regress-00001.h5", 0xBBUB, 10);
+make_member("family_vfd_regress-00002.h5", 0xCCUB, 6);
 
 var assembled_total = assemble_family("family_vfd_regress-%05d.h5",
                                        "family_vfd_regress_out.h5");
-expect_family("assemble_family_total_matches_sum_of_members",
-              assembled_total == 30UL);
+expect_family("assemble_family_total_matches_fixed_stride_placement",
+              assembled_total == 26UL);   /* 2*10 (memb_size) + 6 (last, short) */
 
 /* Comparisons run while the IOS is still open: a mapped byte[] is a lazy
  * proxy into its IOS, not a detached copy -- indexing it after close()
@@ -90,12 +94,12 @@ expect_family("assemble_family_total_matches_sum_of_members",
 var out_ios = open("family_vfd_regress_out.h5", IOS_F_READ);
 var out_size = iosize(out_ios) /#B;
 var member0_intact = bytes_all_equal(byte[10] @ out_ios : 0#B, 0xAAUB);
-var member1_intact = bytes_all_equal(byte[6]  @ out_ios : 10#B, 0xBBUB);
-var member2_intact = bytes_all_equal(byte[14] @ out_ios : 16#B, 0xCCUB);
+var member1_intact = bytes_all_equal(byte[10] @ out_ios : 10#B, 0xBBUB);
+var member2_intact = bytes_all_equal(byte[6]  @ out_ios : 20#B, 0xCCUB);
 close(out_ios);
 
 expect_family("assemble_family_stops_at_first_missing_member",
-              out_size == 30UL);
+              out_size == 26UL);
 expect_family("assemble_family_preserves_first_member_bytes", member0_intact);
 expect_family("assemble_family_preserves_second_member_bytes", member1_intact);
 expect_family("assemble_family_preserves_third_member_bytes", member2_intact);
@@ -104,6 +108,40 @@ var no_members_total = assemble_family("family_vfd_regress_nomatch-%05d.h5",
                                         "family_vfd_regress_empty.h5");
 expect_family("assemble_family_returns_zero_when_first_member_is_missing",
               no_members_total == 0UL);
+
+/* A short *interior* member (member 1, followed by member 2) is rejected
+ * rather than silently gap-filled: real HDF5 only ever allows the last
+ * physical file to be shorter than memb_size (see assemble_family's own
+ * comment on the fixed-stride placement). */
+make_member("family_vfd_regress_shortmid-00000.h5", 0x11UB, 10);
+make_member("family_vfd_regress_shortmid-00001.h5", 0x22UB, 6);
+make_member("family_vfd_regress_shortmid-00002.h5", 0x33UB, 14);
+
+var rejected_short_interior = 0;
+try {
+    var ignored = assemble_family("family_vfd_regress_shortmid-%05d.h5",
+                                   "family_vfd_regress_shortmid_out.h5");
+} catch (Exception e) {
+    rejected_short_interior = 1;
+}
+expect_family("assemble_family_rejects_short_interior_member",
+              rejected_short_interior);
+
+/* A member larger than the discovered stride (memb_size = member 0's
+ * size) is also rejected -- it's inconsistent with fixed-stride
+ * addressing regardless of its position. */
+make_member("family_vfd_regress_oversized-00000.h5", 0x44UB, 10);
+make_member("family_vfd_regress_oversized-00001.h5", 0x55UB, 14);
+
+var rejected_oversized = 0;
+try {
+    var ignored2 = assemble_family("family_vfd_regress_oversized-%05d.h5",
+                                    "family_vfd_regress_oversized_out.h5");
+} catch (Exception e) {
+    rejected_oversized = 1;
+}
+expect_family("assemble_family_rejects_member_larger_than_stride",
+              rejected_oversized);
 
 if (failures != 0) {
     printf("UNIT FAMILY_VFD: %i32d failure(s)\n", failures);

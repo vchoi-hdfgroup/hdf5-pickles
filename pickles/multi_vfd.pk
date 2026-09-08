@@ -73,6 +73,31 @@ load "ohdr_msgs.pk";
  *   multi files are out of scope for now -- see multi_patch_eof()'s
  *   version-check comment below for why (it's not a discovery gap).
  *
+ *   assemble_multi() only supports member addresses below
+ *   MULTI_MAX_REPRESENTABLE_ADDR (2^48 bytes): a single assembled file is
+ *   one flat address space, and poke cannot represent an offset anywhere
+ *   near what HDF5's *default* addressing produces (H5Pset_fapl_multi
+ *   with memb_addr=NULL spreads categories across fractions of
+ *   HADDR_MAX -- the smallest nonzero default, BTREE's HADDR_MAX/6, is
+ *   already ~2^61). In practice this means only custom, deliberately-small
+ *   addresses are supported -- never HDF5's own default scheme. The
+ *   "split" driver (H5Pset_fapl_split) is a convenience preset over this
+ *   same multi driver, not a separate on-disk format, but its addresses
+ *   are hardcoded unconditionally (meta half at 0, raw half at
+ *   HADDR_MAX/2) with no override available at the API level -- so *every*
+ *   real split file exceeds this limit, with no custom-address escape
+ *   hatch the way general multi has. A rejected file isn't necessarily
+ *   unsupported forever, though: multi_resolve_address() resolves one
+ *   logical address to its real (member file, local offset) directly,
+ *   without ever assembling a flat file, so individual structures can
+ *   still be inspected by hand even when assemble_multi() can't build
+ *   anything. Real HDF5 does the same address-to-member translation
+ *   internally on every access (H5FD_multi_read/_write); the difference is
+ *   that HDF5's translation is transparent to the rest of the library,
+ *   while multi_resolve_address() has to be called explicitly by whoever
+ *   wants to read something -- it doesn't make superblock.pk/ohdr_msgs.pk/
+ *   etc. multi-aware automatically.
+ *
  * Load order:
  *   (poke) .load pickles/multi_vfd.pk
  *   (poke) .load pickles/superblock.pk   <- and whatever else you need to
@@ -151,6 +176,22 @@ type multi_member = struct {
  * gheap=4 lheap=5 ohdr=6, so index = enum value - 1. */
 var MULTI_DRAW_INDEX = 2;
 
+/* Largest member start_addr / true_eof assemble_multi() will attempt to
+ * represent in one assembled file. The real ceiling is
+ * filesystem-dependent -- verified empirically at exactly 2^55-1 bytes
+ * on this host, independent of poke (confirmed via plain `truncate`,
+ * bypassing poke entirely) -- so this is set ~128,000x below that for
+ * safety margin across platforms, while still comfortably exceeding any
+ * realistic custom-addressed multi/family file. It's also always below
+ * HDF5's own default Multi/Split addressing (the smallest nonzero
+ * default, BTREE's HADDR_MAX/6, is already ~2^61; Split's raw half is
+ * hardcoded to HADDR_MAX/2 with no override), so in practice this means
+ * assemble_multi() only ever supports custom, deliberately-small
+ * addresses -- never HDF5's default addressing scheme, for either
+ * driver. See multi_resolve_address() for inspecting a file that exceeds
+ * this without assembling it. */
+var MULTI_MAX_REPRESENTABLE_ADDR = 0x0001000000000000UL;   /* 2^48, 256 TiB */
+
 fun multi_member_size = (string path) uint<64>:
 {
     var ios = open(path, IOS_F_READ);
@@ -181,13 +222,68 @@ fun multi_true_eof = (multi_member[6] members) uint<64>:
     return eof;
 }
 
-/* Little-endian encode of the low `n` bytes of `v` (n <= 8). */
+type multi_resolved_address = struct {
+    string   member_path;
+    uint<64> local_offset;
+};
+
+/* Given multi_discover()'s (path, start_addr) mapping and an absolute
+ * logical address, finds which real member file holds it and the local
+ * offset within that file -- the same search H5FD_multi_read does
+ * (largest start_addr <= addr). Works regardless of
+ * MULTI_MAX_REPRESENTABLE_ADDR, since it never builds a file: it's the
+ * only way to inspect a default-addressed multi/split file at all, one
+ * structure at a time, directly from the real member files.
+ *
+ * This is a manual, per-call workaround, not a transparent replacement
+ * for assemble_multi: nothing here makes existing pickles (superblock.pk
+ * etc.) multi-aware automatically. Each caller must call this, then open
+ * member_path and map at local_offset itself, e.g.:
+ *
+ *     var r = multi_resolve_address(members, logical_addr);
+ *     var ios = open(r.member_path);
+ *     set_ios(ios);
+ *     var sb = superblock @ r.local_offset#B;
+ *     close(ios);
+ *
+ * Raises E_inval if logical_addr precedes every member's start_addr
+ * (shouldn't happen for a well-formed mapping, since SUPER's start_addr
+ * is always 0). */
+fun multi_resolve_address = (multi_member[6] members, uint<64> logical_addr)
+    multi_resolved_address:
+{
+    var best_path = "";
+    var best_start = 0UL;
+    var found = 0;
+    for (m in members) {
+        if (m.start_addr <= logical_addr && (!found || m.start_addr >= best_start)) {
+            best_path = m.path;
+            best_start = m.start_addr;
+            found = 1;
+        }
+    }
+    if (!found)
+        raise E_inval;
+    return multi_resolved_address {
+        member_path = best_path,
+        local_offset = logical_addr - best_start
+    };
+}
+
+/* Little-endian encode of `v`, zero-extended or truncated to `n` bytes.
+ * `v` is a uint<64> logical value; for n > 8 the extra high-order bytes
+ * are zero. n is not assumed to be <= 8: real HDF5 superblocks may
+ * legally declare sizeof_addr/sizeof_offsets of 16 or 32, not just 2/4/8
+ * (see H5Fsuper_cache.c's sizeof_addr validation) -- and poke's `.>>`
+ * wraps its shift amount modulo the operand's 64-bit width rather than
+ * zero-extending, so shifting by >= 64 must be special-cased instead of
+ * relied on to yield zero. */
 fun multi_u64_le_bytes_n = (uint<64> v, int n) byte[]:
 {
     var out = byte[n]();
     var i = 0;
     while (i < n) {
-        out[i] = ((v .>> (i * 8)) & 0xffUL) as uint<8>;
+        out[i] = (i < 8) ? ((v .>> (i * 8)) & 0xffUL) as uint<8> : 0UB;
         i = i + 1;
     }
     return out;
@@ -197,12 +293,43 @@ fun multi_u64_le_bytes_n = (uint<64> v, int n) byte[]:
  * checksum) at offset 0 of `output_path` to declare true_eof. Field
  * offsets are computed from the superblock's own sizeof_offsets byte, not
  * hardcoded -- see the v2/v3 layout comment in superblock.pk. */
+/* Real HDF5 files may have a user block (arbitrary reserved space, size
+ * 0 or a power of two >= 512) preceding the superblock -- its size isn't
+ * recorded anywhere a reader can just look up, so the signature must be
+ * searched for: offset 0, then 512, 1024, 2048, ... doubling, matching
+ * H5FD_locate_signature() in H5FDint.c. Raises E_inval if no match is
+ * found within the file. (h5policy's h5_validate.pk has the same
+ * algorithm as h5policy_locate_superblock(), but it's h5policy-specific
+ * -- global state, audit-trail side effects -- so this is a separate,
+ * side-effect-free copy rather than a cross-package dependency.) */
+fun multi_locate_superblock = (int<32> ios) uint<64>:
+{
+    var fsize = iosize(ios) /#B;
+    var candidate = 0UL;
+    var tried_512 = 0;
+    while (1) {
+        if (candidate + 8UL <= fsize
+            && (byte[8] @ ios : candidate#B) == H5_FORMAT_FILE_SIGNATURE)
+            return candidate;
+        if (!tried_512) {
+            candidate = 512UL;
+            tried_512 = 1;
+        } else if (candidate * 2UL + 8UL <= fsize) {
+            candidate = candidate * 2UL;
+        } else {
+            raise E_inval;   /* signature not found within the file */
+        }
+    }
+}
+
 fun multi_patch_eof = (string output_path, uint<64> true_eof) void:
 {
     var ios = open(output_path);
     set_ios(ios);
 
-    var super_vers = byte @ 8#B;
+    var sig_addr = multi_locate_superblock(ios);
+
+    var super_vers = byte @ (sig_addr + 8UL)#B;
     if (super_vers < 2UB) {
         /* Not a discovery limitation -- drv_info.pk's file_drv_info @ off
          * already decodes v0/v1 driver info directly (drv_info_addr_raw is
@@ -221,18 +348,25 @@ fun multi_patch_eof = (string output_path, uint<64> true_eof) void:
                super_vers);
         raise E_inval;
     }
-    var sizeof_offsets = (byte @ 9#B) as int;
+    var sizeof_offsets = (byte @ (sig_addr + 9UL)#B) as int;
 
-    /* v2/v3 layout after the 8-byte signature (superblock.pk):
+    /* v2/v3 layout after the 8-byte signature (superblock.pk), relative
+     * to sig_addr (the real superblock's own start, past any user
+     * block):
      *   super_vers(1) sizeof_offsets(1) sizeof_lengths(1) status_flags(1)
      *   base_addr(sizeof_offsets) ext_addr(sizeof_offsets)
      *   eof_addr(sizeof_offsets) root_addr(sizeof_offsets) chksum(4) */
-    var eof_off = 12 + 2 * sizeof_offsets;
-    var chksum_off = 12 + 4 * sizeof_offsets;
+    var eof_off = sig_addr + 12UL + 2UL * (sizeof_offsets as uint<64>);
+    var chksum_off = sig_addr + 12UL + 4UL * (sizeof_offsets as uint<64>);
+    var chksum_len = (chksum_off - sig_addr) as int;
 
     byte[sizeof_offsets] @ eof_off#B = multi_u64_le_bytes_n(true_eof, sizeof_offsets);
 
-    var new_chksum = lookup3_hashlittle(byte[chksum_off] @ 0#B, 0U);
+    /* The checksum covers only the superblock's own bytes, starting at
+     * sig_addr -- never the user block prefix (H5Fsuper_cache.c encodes
+     * it via H5_checksum_metadata(_image, ...), where _image is the
+     * superblock's own encode buffer, not the whole file). */
+    var new_chksum = lookup3_hashlittle(byte[chksum_len] @ sig_addr#B, 0U);
     byte[4] @ chksum_off#B = hdf5_u32_le_bytes(new_chksum);
 
     close(ios);
@@ -243,18 +377,56 @@ fun multi_patch_eof = (string output_path, uint<64> true_eof) void:
  * superblock eof_addr/checksum to the true virtual EOF across all six
  * members. Returns the number of bytes actually copied (excludes the
  * deferred raw-data member). */
+/* poke-version-agnostic replacement for
+ * IOS_F_CREATE|IOS_F_TRUNCATE (which requires poke >= 5.0). Probes
+ * whether PATH already exists; if so raises E_inval rather than
+ * silently mixing stale bytes with new content. */
+fun open_fresh = (string path) int<32>:
+{
+    try {
+        var probe = open(path, IOS_F_READ);
+        close(probe);
+        raise E_inval;
+    } catch (Exception e) {
+        if (e.code == E_inval.code)
+            raise e;
+    }
+    return open(path, IOS_F_CREATE | IOS_F_WRITE | IOS_F_READ);
+}
+
 fun assemble_multi = (multi_member[6] members, string output_path) uint<64>:
 {
-    var out = open(output_path, IOS_F_CREATE | IOS_F_TRUNCATE | IOS_F_WRITE | IOS_F_READ);
-    var total = 0UL;
+    /* Check every member's start_addr, and the true cross-member EOF,
+     * against MULTI_MAX_REPRESENTABLE_ADDR before creating any output
+     * file -- a default-addressed multi/split file (or anything else
+     * whose declared addresses exceed what this tool can represent)
+     * gets a clear rejection instead of a half-written file or a raw
+     * poke I/O failure partway through assembly. */
+    var true_eof = multi_true_eof(members);
+    if (true_eof >= MULTI_MAX_REPRESENTABLE_ADDR) {
+        printf("assemble_multi: true EOF %v exceeds the maximum address this tool can represent (%v) -- likely a default-addressed multi/split file; see multi_resolve_address() to inspect it without assembling\n",
+               true_eof, MULTI_MAX_REPRESENTABLE_ADDR);
+        raise E_inval;
+    }
     var i = 0;
+    while (i < 6) {
+        if (members[i].start_addr >= MULTI_MAX_REPRESENTABLE_ADDR) {
+            printf("assemble_multi: member %v start_addr %v exceeds the maximum address this tool can represent (%v) -- likely a default-addressed multi/split file; see multi_resolve_address() to inspect it without assembling\n",
+                   i, members[i].start_addr, MULTI_MAX_REPRESENTABLE_ADDR);
+            raise E_inval;
+        }
+        i = i + 1;
+    }
+
+    var out = open_fresh(output_path);
+    var total = 0UL;
+    i = 0;
     while (i < 6) {
         if (i != MULTI_DRAW_INDEX)
             total = total + multi_copy_member(out, members[i]);
         i = i + 1;
     }
 
-    var true_eof = multi_true_eof(members);
     /* Extend the sparse file to the full declared EOF even when the
      * deferred raw-data category is the highest-addressed member, so the
      * real backing extent never falls short of what eof_addr declares. */
@@ -378,11 +550,12 @@ fun multi_discover = (string ohdr_candidate_path, string base_name) multi_member
     var n_unique = count_unique(mapping) as int;
     var addrs = dvi.drv_info.multi.member_addrs;
     var templates = multi_split_names(dvi.drv_info.multi.member_names_raw, n_unique);
+    var cat_idx = multi_category_indices(mapping);
 
     var result = multi_member[6]();
     var cat = 0;
     while (cat < 6) {
-        var idx = (mapping[cat] as int) - 1;
+        var idx = cat_idx[cat];
         result[cat] = multi_member {
             path = multi_expand_name_template(templates[idx], base_name),
             start_addr = addrs[idx].start_addr

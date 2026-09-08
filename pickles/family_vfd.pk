@@ -117,21 +117,62 @@ fun family_member_name = (string pattern, int i) string:
     return prefix + num + suffix;
 }
 
+/* poke-version-agnostic replacement for
+ * IOS_F_CREATE|IOS_F_TRUNCATE (which requires poke >= 5.0). Probes
+ * whether PATH already exists; if so raises E_inval rather than
+ * silently mixing stale bytes with new content. */
+fun open_fresh = (string path) int<32>:
+{
+    try {
+        var probe = open(path, IOS_F_READ);
+        close(probe);
+        raise E_inval;
+    } catch (Exception e) {
+        if (e.code == E_inval.code)
+            raise e;
+    }
+    return open(path, IOS_F_CREATE | IOS_F_WRITE | IOS_F_READ);
+}
+
 fun assemble_family = (string pattern, string output_path) uint<64>:
 {
-    var out = open(output_path, IOS_F_CREATE | IOS_F_TRUNCATE | IOS_F_WRITE | IOS_F_READ);
-    var total = 0UL;
+    var out = open_fresh(output_path);
+    var memb_size = 0UL;
     var i = 0;
     var done = 0;
+    var total = 0UL;
+    var prev_short = 0;   /* was member i-1 shorter than memb_size? */
 
     while (!done) {
         var member_name = family_member_name(pattern, i);
         try {
             var mf = open(member_name, IOS_F_READ);
+            /* Reaching here proves member i-1 (if any) was not the last
+             * member. A short i-1 is then an interior short member --
+             * real HDF5 never produces this (only the last physical
+             * file may be shorter than memb_size) -- so reject rather
+             * than silently letting the fixed-stride placement below
+             * leave an unexplained gap. */
+            if (prev_short) {
+                close(mf);
+                close(out);
+                raise E_inval;
+            }
+
             var msize = iosize(mf) /#B;
-            ios_copy_bytes(mf, out, 0#B, total#B, msize#B);
-            total = total + msize;
+            if (i == 0)
+                memb_size = msize;
+            else if (msize > memb_size) {
+                close(mf);
+                close(out);
+                raise E_inval;   /* larger than the discovered stride */
+            }
+
+            ios_copy_bytes(mf, out, 0#B, ((i as uint<64>) * memb_size)#B, msize#B);
             close(mf);
+
+            total = (i as uint<64>) * memb_size + msize;
+            prev_short = (msize < memb_size);
             i = i + 1;
         } catch (Exception e) {
             done = 1;

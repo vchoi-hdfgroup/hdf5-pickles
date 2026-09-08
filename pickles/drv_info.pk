@@ -97,22 +97,71 @@ fun file_drv_type = (char[8] id) int:
         return(0);
 }
 
-/* Count distinct non-zero values in the 6-byte multi-driver member mapping. */
+/* Resolves multi-driver mapping byte `mapping[cat]` (cat 0-indexed,
+ * 0=SUPER..5=OHDR) to the H5F_mem_t enum value (1-6) it's actually
+ * merged into: 0 (H5FD_MEM_DEFAULT) on disk means "identity" -- this
+ * category owns its own member -- not "unmapped"/"skip". Any other
+ * value names which other category's member this one shares. */
+fun multi_resolve_category = (byte[6] mapping, int cat) int:
+{
+    var raw = mapping[cat] as int;
+    if (raw == 0)
+        return cat + 1;
+    return raw;
+}
+
+/* For each of the 6 categories (0=SUPER..5=OHDR), the 0-based index into
+ * the compacted per-unique-member arrays (member_addrs/member_names_raw)
+ * that category's real data lives at. Matches upstream's
+ * UNIQUE_MEMBERS_CORE macro (H5FDmulti.c): walk categories in fixed
+ * SUPER..OHDR order, resolving 0 to self (see multi_resolve_category);
+ * each newly-resolved value gets the next sequential compacted-array
+ * position, and every later category resolving to the same value reuses
+ * that same position -- this is also the order the on-disk compacted
+ * arrays are written in, not a dense 1-based index into mapping itself. */
+fun multi_category_indices = (byte[6] mapping) int[6]:
+{
+    var resolved = int[6]();
+    var cat = 0;
+    while (cat < 6) {
+        resolved[cat] = multi_resolve_category(mapping, cat);
+        cat = cat + 1;
+    }
+
+    var slot_for_value = int[7]();   /* index 1..6; -1 = not yet assigned */
+    cat = 0;
+    while (cat < 7) { slot_for_value[cat] = -1; cat = cat + 1; }
+
+    var idx = int[6]();
+    var next_index = 0;
+    cat = 0;
+    while (cat < 6) {
+        var v = resolved[cat];
+        if (slot_for_value[v] == -1) {
+            slot_for_value[v] = next_index;
+            next_index = next_index + 1;
+        }
+        idx[cat] = slot_for_value[v];
+        cat = cat + 1;
+    }
+    return idx;
+}
+
+/* Count of distinct unique members represented by the 6-byte multi-driver
+ * mapping -- i.e. how many entries member_addrs/member_names_raw
+ * actually hold. 0 bytes are identity (self), not "unmapped": an
+ * all-identity mapping [0,0,0,0,0,0] is 6 distinct members, not 0. */
 fun count_unique = (byte[6] m) uint<64>:
 {
-    var seen_1 = 0; var seen_2 = 0; var seen_3 = 0;
-    var seen_4 = 0; var seen_5 = 0; var seen_6 = 0;
-    var n = 0UL;
-    for (mm in m) {
-        var idx = mm as int;
-        if (idx == 1 && seen_1 == 0) { seen_1 = 1; n = n + 1UL; }
-        if (idx == 2 && seen_2 == 0) { seen_2 = 1; n = n + 1UL; }
-        if (idx == 3 && seen_3 == 0) { seen_3 = 1; n = n + 1UL; }
-        if (idx == 4 && seen_4 == 0) { seen_4 = 1; n = n + 1UL; }
-        if (idx == 5 && seen_5 == 0) { seen_5 = 1; n = n + 1UL; }
-        if (idx == 6 && seen_6 == 0) { seen_6 = 1; n = n + 1UL; }
+    var idx = multi_category_indices(m);
+    var maxidx = -1;
+    var cat = 0;
+    while (cat < 6) {
+        if (idx[cat] > maxidx)
+            maxidx = idx[cat];
+        cat = cat + 1;
     }
-    return n;
+    return (maxidx + 1) as uint<64>;
 }
 
 /* Address pair for one member file in the multi driver.
