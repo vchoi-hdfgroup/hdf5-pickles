@@ -7,10 +7,10 @@ where a value decoded from untrusted HDF5 file bytes is validated only by
 disappear identically under `-DNDEBUG`, i.e. in every shipped Release build,
 so both count as "assert-masked" here.
 
-Two of the issue's seven named areas are complete (SOHM, Extensible arrays);
-the other five (V2 B-trees, Dataset chunk records, Fractal heaps, Free-space
-managers, Metadata-cache images) are not yet started. This is a first pass,
-not a final document.
+Five of the issue's seven named areas are complete (SOHM, Extensible
+arrays, V2 B-trees, Free-space managers, Metadata-cache images); the other
+two (Dataset chunk records, Fractal heaps) are not yet started. This is a
+first pass, not a final document.
 
 ## Scope
 
@@ -31,6 +31,15 @@ and then observing both `h5policy`'s verdict and a real libhdf5 build's
 actual behavior (timing, memory, and, where useful, the full HDF5 error
 stack via a minimal C reproducer). Findings not yet given this treatment are
 marked "traced, not yet measured" rather than assumed either way.
+
+**Abbreviations used throughout the tables below:** OOM (out-of-memory), DoS
+(denial-of-service), ASan (AddressSanitizer, a compiler instrumentation that
+crashes immediately at the point of an invalid memory access rather than
+letting the corruption surface later or silently), RSS (resident set size —
+a process's actual physical-memory usage), and the POSIX signals SIGSEGV
+(invalid memory access), SIGABRT (abnormal-termination request, often from
+an internal safety check firing), and SIGBUS (a fatal bus error, e.g. a
+misaligned or unmapped access).
 
 ## SOHM (`H5SM*.c`, 170 asserts across 5 files — complete)
 
@@ -91,7 +100,7 @@ one level deeper in the call graph, each with its own root-cause site:
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | `max_nelmts_bits` + `data_blk_min_elmts` (→ `hdr->nsblks`) | `H5EAcache.c:320-328` (shared, see above) | `H5EAhdr.c:180-182` (weak, nonzero-only) | **Measured: severe out-of-memory (OOM) denial-of-service (DoS)** — 1 byte changed, 55GB+ RAM, OOM-killed after 22s, ordinary dataset read | Confirmed: dedicated geometry check rejects instantly |
+| 1 | `max_nelmts_bits` + `data_blk_min_elmts` (→ `hdr->nsblks`) | `H5EAcache.c:320-328` (shared, see above) | `H5EAhdr.c:180-182` (weak, nonzero-only) | **Measured: severe OOM DoS** — 1 byte changed, 55GB+ RAM, OOM-killed after 22s, ordinary dataset read | Confirmed: dedicated geometry check rejects instantly |
 | 2 | `max_dblk_page_nelmts_bits` (→ `dblk_page_nelmts` via `1 << max_dblk_page_nelmts_bits`) | same | `H5EAcache.c:1011,1014,1018,1423` (react after the fact) | Measured: data-loss-on-read (checksum mismatch, no crash) | Confirmed, same check |
 | 3 | `sup_blk_min_data_ptrs` | same | — | Measured: data-loss-on-read (checksum mismatch); a cross-field variant (`nsblk_addrs`, computed unguarded at `H5EAiblock.c:113-115` — see row 7) caught by a 3rd, distinct incidental mechanism — see below | Confirmed, same check |
 | 4 | `raw_elmt_size` | same | — | Measured: data-loss-on-read (checksum mismatch) | Confirmed, same check |
@@ -145,9 +154,254 @@ play here.
 A separate, non-assert-masked finding (`max_idx_set`) was also found in this
 area during the same sweep — see **Adjacent findings**, below.
 
+## V2 B-trees (`H5B2*.c`, 344 asserts across 9 files — complete)
+
+Three findings, all independently measured against a real fixture: two are
+genuine `h5policy` coverage gaps (`merge_percent` thrashing; the by-index
+descent pin leak), one is a real, bounded hazard that turns out to already
+be covered (`node_size`). A fourth, differently-shaped finding —
+`node_nrec` feeding a checksum-length computation with no bound against the
+real buffer size — is covered separately under **Adjacent findings**,
+below, since (like Extensible Arrays' `max_idx_set`) it is not literally
+assert-masked: nothing guards it at all, not even an assert. Five of the
+nine files (`H5B2internal.c`, `H5B2int.c`, `H5B2dbg.c`, `H5B2test.c`,
+`H5B2stat.c`) reconcile entirely to write-path bookkeeping, debug-tool-only,
+or test-only code, and contribute nothing.
+
+`node_size` and `merge_percent`/`split_percent` share one root cause:
+`H5B2__hdr_init` (`H5B2hdr.c:107-116`) asserts several properties of its
+`cparam` argument — this function runs both at B-tree-creation time
+(trusted caller) and directly from the deserialize path
+(`H5B2cache.c:288`, right after `cparam.node_size`, `cparam.split_percent`
+and `cparam.merge_percent` are decoded raw at `H5B2cache.c:261,270-271`
+with no check at the decode site itself) — so its argument asserts are
+genuine deserializer invariants, not just internal contracts.
+
+| # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
+|---|---|---|---|---|---|
+| 1 | `node_size` sanity | `H5B2cache.c:261` (shared, see above) | `H5B2hdr.c:112` (`assert(cparam->node_size > 0)`) | **Measured: real, bounded resource spike.** Patched to the field's own on-disk maximum (`0xFFFFFFFF`, a fixed 4-byte field). `H5B2__hdr_init` eagerly `malloc`s and `memset`s a `node_size`-sized scratch buffer *before any node is ever read* — ~898MB peak RSS, ~1.1s delay opening a 15KB file, no crash. Caught afterward, incidentally, by an unrelated addr-vs-end-of-allocation check when the same corrupted value is later used as a leaf's read length | Confirmed: dedicated check (`H5_CORRUPT_V2_BTREE_NODE_SIZE`, `node_size > file_size`) — not a gap |
+| 2 | `merge_percent < split_percent / 2` | `H5B2cache.c:270-271` (shared, see above) | `H5B2hdr.c:116` | **Measured: real tree-shape pathology, write-path only.** Violating the safety margin (`merge_percent=50` against `split_percent=100`) made both children of a fresh split land exactly on the corrupted merge threshold; the very next ordinary delete triggered a premature merge, collapsing a two-child, 46-record split straight back into one 45-record leaf. Every record stayed correctly tracked throughout — no data loss, no wrong content — just needless, repeated split-then-remerge churn on ordinary write traffic near the threshold | **None — confirmed coverage gap.** No pickle validates the header's own `split_percent`/`merge_percent` bytes at all (a same-named pair of fields elsewhere, in an unrelated message type, is checked, but not these) |
+| 3 | Internal node's per-child `all_nrec` consistency (by-index descent) | `H5B2cache.c:672-678` — `node_ptrs[].all_nrec` decoded raw, no check at the decode site itself | `H5B2.c:826` (`assert(0 && "Index off end of tree??")`) — the only thing standing between a corrupted per-child count and a broken descent | **Measured: metadata-cache resource leak, not a crash.** The internal node's `H5AC_unprotect` call is only reached in the sibling branch, so a masked failure here leaves it permanently protected; the stale, un-advanced node pointer gets reprocessed at the wrong depth, eventually failing a checksum check against what should be a leaf. On `H5Fclose`, the leaked pin makes `H5C__flush_invalidate_ring` report `"Pinned entry count not decreasing"`, followed by the library's own `"infinite loop closing library"` diagnostic — a real, malformed-shutdown malfunction, not a true hang | **None — confirmed coverage gap.** Accepts the crafted file outright |
+
+**Recommendation for finding 2, `merge_percent` (not implemented here):**
+the same two-fix shape as SOHM's finding #5. On the libhdf5 side, the three
+asserts on `cparam->split_percent`/`cparam->merge_percent`
+(`H5B2hdr.c:114-116`) could be promoted to a real, always-on check at
+header-deserialize time — safe to do unconditionally, since no legitimate
+writer can ever produce a file violating these relationships (every real
+client class hardcodes valid percentages at creation time). On the
+`h5policy` side, that promotion alone adds nothing: there is no existing
+check on the header's own `split_percent`/`merge_percent` bytes to
+strengthen, so closing the gap needs a genuinely new check in
+`h5policy/pickles/h5_btree2.pk` for these two fields and their
+cross-relationship. Both left as recommendations, not changes, in this PR.
+
+**Recommendation for finding 3, the index-off-end pin leak (not
+implemented here):** on the libhdf5 side, the assert at `H5B2.c:826` could
+become a real, always-on error — but the fix isn't just swapping `assert`
+for `HGOTO_ERROR`: the branch would also need to release the
+currently-protected internal node before returning, exactly as its sibling
+branch already does, or the resource leak persists even with a clean error
+path. On the `h5policy` side, `h5_btree2.pk` already has a related check
+(`H5_CORRUPT_V2_BTREE_SUBTREE_COUNT`) — but it only catches a *local*
+inconsistency, one child pointer's `all_nrec` being less than its own
+`node_nrec` (confirmed by reading the check itself: `child_total <
+child_nrec`, which our fixture's corruption — `all_nrec` reduced to 100
+against a `node_nrec` of 12 — never triggers, since 100 is still greater
+than 12). It does not check the *cross-sibling* sum this bug actually
+depends on: whether a node's `node_ptrs[]` entries, taken together, sum to
+what the level above expects. Closing this gap needs extending that
+existing validation to the cross-sibling sum, not writing one from scratch.
+Left as a recommendation, not a change, in this PR.
+
+**Also checked, not a vulnerability:** `H5B2hdr.c:165`
+(`assert(hdr->max_nrec_size <= H5B2_SIZEOF_RECORDS_PER_NODE)`) looked like a
+candidate for the same shape of bug as row 3 — a silently-truncated width
+misaligning every subsequent record decode — but tracing where
+`max_nrec_size` is actually consumed shows the downcast that follows it
+(`uint8_t`, range 0-255) has far more headroom than any real `node_size`
+could ever need (at most 8 bytes, since `hsize_t` is 64-bit), and the value
+is computed and used consistently on both the write and read side wherever
+it appears. Skipping this assert most likely just lets an unusually large
+node use a wider, still-correct encoding instead of tripping a
+"bigger-than-expected" sanity check — reasoned through, not independently
+fixture-tested, but not pursued further as a result.
+
+**Also checked, and likewise not pursued:** `H5B2hdr.c:172`
+(`assert(hdr->node_info[u].max_nrec <= hdr->node_info[u - 1].max_nrec)`),
+checking that a deeper level's internal-node capacity never exceeds a
+shallower level's. This one is closer to a proof than a search. A level's
+capacity, `H5B2_NUM_INT_REC(h, d)` (`H5B2pkg.h:109-111`), is `node_size`
+divided by a per-slot cost that includes `node_info[d-1].cum_max_nrec_size`
+— the byte-width needed to encode the *cumulative* record count one level
+down. That cumulative count is defined recursively,
+`cum_max_nrec[d] = (max_nrec[d] + 1) * cum_max_nrec[d-1] + max_nrec[d]`,
+which can only equal or exceed the level below it, never fall short — so
+the byte-width needed to encode it, the per-slot cost, and therefore
+capacity itself (a fixed `node_size` divided by a non-decreasing cost) are
+all forced to move monotonically the right way, for any legal
+`node_size`/`rrec_size`. Checked directly against the real numbers measured
+on `dense_links_deep.h5` earlier in this document (`45`/`24`/`22` across
+depths 0-2): the formula reproduces those exactly. What wasn't chased:
+unlike the `max_nrec_size` item above, this conclusion rests on the
+*triggering condition* being unreachable, not on tracing what would happen
+downstream if it somehow were — a different, and here untested, kind of
+"safe."
+
+**Related, still-live hazard in this area — not this session's discovery,
+partially re-verified where noted.** `H5G__obj_get_linfo` sizes a group's
+in-memory link table directly from the v2 B-tree header's own declared
+`total_nrec` (`hdr->root.all_nrec`, via `H5B2_get_nrec()`, no validation),
+then `H5G__dense_build_table` fills that table by walking the tree for
+real — a completely independent count. The two are supposed to always
+agree, and only one direction of their disagreeing is actually guarded:
+
+- **`total_nrec` understated** (declares `n-1`, tree really holds `n`): the
+  table is allocated one slot short. `H5G__dense_build_table_cb`'s array
+  write — `ltable->lnks[udata->curr_lnk]` — would run one slot past the
+  allocation on the tree's last real record. The *only* thing standing in
+  the way is `assert(udata->curr_lnk < udata->ltable->nlinks)`
+  (`H5Gdense.c:716`) — masked under `-DNDEBUG`, at which point the
+  out-of-bounds write happens for real, later surfacing as a `SIGABRT`
+  (glibc's heap-corruption detector, on some later allocation).
+- **`total_nrec` overstated** (`n+1` instead of `n`): the table gets one
+  extra slot the walk never reaches, left at its zero-initialized `NULL`
+  name. This direction has **no guard at all, not even this assert** — the
+  crash happens later and elsewhere, when the table's own sort comparator
+  (`H5G__link_cmp_name_inc`) dereferences that `NULL`, causing `SIGSEGV`.
+
+Two of the three claims above are independently confirmed this session by
+direct inspection; one is cited from prior work, not reproduced:
+
+- **Confirmed by direct source read:** the guard is still exactly
+  `assert(udata->curr_lnk < udata->ltable->nlinks)` at this exact commit
+  (`4ee8adc29cd`) — the same one this whole catalog is measured against.
+  Not fixed in libhdf5 itself, in either direction.
+- **Confirmed by a live re-test:** `h5policy`, as it stands in the tree
+  today, rejects a `total_nrec` off by `+1`, `-1`, or set to `0` — all three
+  tested directly this session.
+- **Not reproduced this session** — cited from
+  `registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`: the
+  actual crash behavior against a real, running libhdf5 build (the
+  `SIGSEGV`/`SIGABRT` pair described above). That measurement predates this
+  session; see the case file for its full history.
+
+Net: a real, currently-live hazard in this exact area, on this exact
+commit — closed on the `h5policy` side, still open in libhdf5 itself.
+
+**Not chased further this session:** a companion assert on the same
+by-index descent path, `H5B2.c:848` (`assert(idx < leaf->nrec)`, with a
+write-side twin at `H5B2leaf.c:866`) — the final bound check once descent
+reaches a leaf, rather than the internal-node "off end" check in row 3
+above. Reaching it (rather than row 3's failure mode) would need a more
+surgical corruption that stays checksum-valid at every level while still
+landing a leaf with a too-large `idx` — real effort for what traces to a
+likely lower ceiling (an in-bounds but garbage native-record read, not an
+out-of-bounds one) than row 3's confirmed resource leak. Identified, not
+fixture-tested.
+
+## Free-space managers (`H5FS*.c`, 348 asserts across 7 files — complete)
+
+Four findings, all independently measured against a real fixture: two are
+genuine `h5policy` coverage gaps (`tot_sect_count`, understated direction;
+`tot_space`), two are real, severe hazards that turn out to already be
+covered — `node_count` (newly discovered this session) and `sect_size`
+(pre-existing, discovered in a prior session). A fifth, differently-shaped
+finding — `max_sect_addr` driving an unbounded per-section address width — is
+covered separately under **Adjacent findings**, below, since (like
+Extensible Arrays' `max_idx_set` and V2 B-trees' `node_nrec`) it is not
+literally assert-masked: nothing guards it at all, not even an assert. Five
+of the seven files (`H5FS.c`, `H5FSdbg.c`, `H5FSint.c`, `H5FStest.c`,
+`H5FSstat.c`) reconcile entirely to lifecycle/API-contract bookkeeping,
+debug-tool-only, or test-only code, and contribute nothing; the two that do
+are `H5FScache.c` (the deserialize callbacks) and `H5FSsection.c` (the
+in-memory section-info machinery `H5FS__sinfo_new` derives its per-section
+address width from).
+
+`tot_sect_count`, `serial_sect_count`, `ghost_sect_count`, and `tot_space`
+are decoded together, with no validation at the decode site, in
+`H5FS__cache_hdr_deserialize` (`H5FScache.c:258-265`).
+`H5FS__cache_sinfo_deserialize` (`H5FScache.c:967-1051`) rebuilds all four by
+walking the real section list, then only *checks* the header's original
+claim against five back-to-back asserts (`H5FScache.c:1045-1050`) — every
+one of which vanishes under `-DNDEBUG`.
+
+| # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
+|---|---|---|---|---|---|
+| 1 | `tot_sect_count`/`serial_sect_count` vs. the real section-list walk | `H5FScache.c:258-265` (shared, see above) | `H5FScache.c:1045-1046` (`assert(old_tot_sect_count == fspace->tot_sect_count)`, `assert(old_serial_sect_count == ...)`) | **Measured, bidirectional.** Understated (3→2): the walk's own early-exit (`if (fspace->tot_sect_count == old_tot_sect_count) break;`) stops one real section short — a genuine, legitimately-free 4800-byte region silently vanishes from `h5stat -s`'s report, no crash, no error. Overstated (3→10): `h5policy` already catches this direction (see next column), but if it didn't, the same corrupted value would reach real applications first — `H5Fget_free_sections()`'s returned count (from `H5FS_sect_stats`, a bare accessor read *before* the correcting walk) decouples from how many entries it actually fills, observed as 7 zero-valued phantom sections via `h5stat -s`'s `calloc`-based buffer (a `malloc`-based caller would see stale heap contents instead) | **Understated: confirmed gap, accepts outright.** Overstated: **not a gap** — `h5policy_walk_fspace_sections` (`h5_messages.pk:1128`, `while (seen < serial_sect)`) also drives its own walk length from the header's declared count, but a *higher* declared count than the list actually holds runs the loop past the real records and trips `H5_CORRUPT_FSM_SECTION_OVERRUN` before it can finish — asymmetric coverage, not by design |
+| 2 | `tot_space` vs. the real section-list walk | `H5FScache.c:255-256` (`H5F_DECODE_LENGTH`, no check) | `H5FScache.c:1050` (`assert(old_tot_space == fspace->tot_space)`) | **Measured: unconditional, un-self-correcting silent misreporting.** `H5MF_get_freespace()` → `H5FS_sect_stats(fs_man, &tot_space, NULL)` never requests the section list at all, so there is no path — self-correcting or otherwise — back to the true value. A single corrupted header field (12480 → 99999999) made `h5stat`'s summary report 100002348 bytes free, 301066.8% of the file's own size, with zero error or warning | **Confirmed gap.** `h5policy_walk_fspace_manager` (`h5_messages.pk:1215-1334`) never even decodes `tot_space` — no variable, no check exists to strengthen |
+| 3 | `node_count` (sections-per-size-group counter) | `H5FScache.c:995` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:996` (`assert(node_count)`) — nonzero only, no upper bound | **Measured: CPU-exhaustion DoS.** One byte, 1→200, turned an instant `h5stat -s` into a 2:54+ CPU-pinned hang (99%+ CPU, flat ~3.8MB RSS) before being killed, with no sign of completing | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1142-1149`, `node_count > serial_sect - seen`) already bounds it relationally against the remaining declared count |
+| 4 | `sect_size` (a section's own serialized size) | `H5FScache.c:998-1000` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:1000` (`assert(sect_size)`) — nonzero only | Pre-existing, not newly discovered this session — see `registry/cases/fsm-section-bin-range.yml`. Re-verified this session: the consumer-side hazard (`H5FS__sinfo_new`'s `sinfo->nbins = H5VM_log2_gen(fspace->max_sect_size)` sizing an array later indexed by `H5VM_log2_gen(sect->size)` with no bound, `H5FSsection.c:764,934`) is unchanged at this commit | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1159-1162`) has a dedicated relational check, `H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX` |
+
+**Recommendation for finding 1, `tot_sect_count` understated (not
+implemented here):** `h5policy_walk_fspace_sections`
+(`h5_messages.pk:1064-1209`) drives its own walk length from the header's
+declared `serial_sect` the same way libhdf5 does, and never checks
+afterward that the walk actually reached the section list's checksum
+boundary (`limit`, computed at line 1126). Closing the gap needs one added
+check after the `while (seen < serial_sect)` loop: if `cur != limit`, the
+section list contains more real, well-formed section records than the
+header declared, and should be rejected the same way an *overstated* count
+already is. This alone would also make the overstated/understated coverage
+symmetric.
+
+**Recommendation for finding 2, `tot_space` (not implemented here):** needs
+a new check in `h5policy_walk_fspace_manager`/`h5policy_walk_fspace_sections`
+(`h5_messages.pk`): decode the header's `tot_space` field (at
+`hdr_addr#B + 6#B`, currently never extracted) and compare it against the
+sum of each real section's `sect_size` accumulated during the walk,
+rejecting a mismatch the same way libhdf5's own (masked) assert intends to,
+but as a real, always-on check.
+
+**Also checked, confirmed inert:** `ghost_sect_count`, the fourth field in
+the same header cluster, decoded with equally zero validation. Patched 0→5
+(leaving `tot_sect_count`/`serial_sect_count` and the real section list
+untouched): `h5policy` rejects it via a different, already-existing
+cross-field check (`H5_CORRUPT_FSM_SECTION_COUNT`,
+`serial_sect + ghost_sect != tot_sect`, tripped even without touching the
+other two fields), and the real build's `h5stat` output (default and `-s`)
+was byte-for-byte identical to the valid seed's. Unlike its three siblings,
+`ghost_sect_count` drives no loop-control condition and backs no
+public-facing accessor — genuinely inert, not a finding.
+
+## Metadata-cache images (`H5AC*.c`, `H5Cimage.c`, `H5Ocache_image.c`, 532 asserts across 6 files — complete)
+
+Zero assert-masked findings in this area — a first for this catalog.
+`H5AC.c` (116 asserts) is pure lifecycle/wrapper code around the generic
+cache layer, with real, always-on checks (not asserts) guarding the one
+application-supplied config struct it validates. `H5ACdbg.c` (16 asserts)
+is debug-tool-only, most of its functions gated by `#ifndef NDEBUG` and not
+even compiled into a release build. `H5ACmpio.c` (134 asserts) is entirely
+wrapped in a single `#ifdef H5_HAVE_PARALLEL` from its first line to its
+last — the whole file compiles to nothing outside an MPI-parallel build,
+unreachable from an ordinary single-process open of an untrusted file.
+`H5ACproxy_entry.c` (28 asserts) defines a pure in-memory placeholder
+object — its own class registration sets `deserialize`/`verify_chksum`/
+`get_initial_load_size` all to `NULL`, since it never touches disk.
+`H5Ocache_image.c` (15 asserts) is the actual decode site for the cache
+image's `addr`/`size` fields (reached from `H5Fsuper.c`; added to this
+area's scope mid-sweep since it isn't named `H5AC*`) — its real
+hazard-relevant checks turned out to be genuine, always-on `HGOTO_ERROR`s
+(overflow and EOA-range checks), not masked asserts.
+
+`H5Cimage.c` (223 asserts) holds the one real result from this area — but
+it isn't assert-masked either, so it's written up under **Adjacent
+findings**, below, rather than tabulated here: a deliberate design choice,
+stated in the source's own comments, to skip checksum verification
+entirely for metadata delivered via a cache image.
+
+**Scope notes:** `H5Ocache_image.c` and the prefetched-entry-specific
+portions of `H5Centry.c` (the consumer of the Adjacent finding below) were
+added to this area's scope mid-sweep — both are genuinely part of the
+cache-image feature's implementation, just not named `H5AC*`.
+`H5Centry.c` in full (4,239 lines, mostly generic entry-lifecycle code
+shared by every cache client in the library) was not swept — only its two
+prefetched-entry-specific functions were read, the same exclusion applied
+to `H5C.c` in every prior area.
+
 ## Adjacent findings (not literally assert-masked, same danger shape)
 
-### `max_idx_set` — unbounded loop, reachable via a public API, zero `h5policy` coverage
+### Extensible arrays — `max_idx_set` — unbounded loop, reachable via a public API, zero `h5policy` coverage
 
 `hdr->stats.stored.max_idx_set` ("highest element index stored, +1") is one
 of six *array-statistics* fields in the extensible-array header (a
@@ -221,12 +475,264 @@ threshold; a follow-up attempt via `H5Dget_chunk_info_by_coord()` to query
 one index directly itself stalled unexpectedly for 30s+, likely a
 different mechanism, not pursued further.
 
+### V2 B-trees — `node_nrec` — checksum-length computation with no bound against the real buffer, already caught by `h5policy`
+
+A node's own record count, `node_nrec`, is decoded raw with no validation
+at all — at the header level (`H5B2cache.c:275`, the root's own count) and
+at the internal-node level (`H5B2cache.c:672-673`, each child pointer's own
+count). Unlike the findings in the V2 B-trees table above, there is no
+assert anywhere in this path; it is simply unchecked, on any path, in any
+build configuration. That count then sizes the **checksum computation**
+that gates loading the *next* node down — not the actual allocated buffer:
+
+```c
+/* H5B2cache.c:970 (leaf) / :569-570 (internal) */
+chk_size = H5B2_LEAF_PREFIX_SIZE + (udata->nrec * udata->hdr->rrec_size);
+H5F_get_checksums(image, chk_size, &stored_chksum, &computed_chksum);
+```
+
+`image` is a buffer of exactly `hdr->node_size` bytes — fixed, and
+unrelated to `nrec`, since `get_initial_load_size` always returns
+`node_size` regardless of what `nrec` claims. `H5F_get_checksums`
+(`H5Fio.c:511-539`) trusts `chk_size` completely and reads that many bytes
+from the buffer with no bound of its own.
+
+**Measured:** patched a single node's own `node_nrec` field (`0xFFFF`) in
+two real fixtures — one where the root is directly a leaf, one where it's
+an internal node — reseal the node's own header checksum, nothing else
+touched. `h5policy --profile untrusted-strict` rejects both outright, with
+a *dedicated* check (`H5_CORRUPT_V2_BTREE_NODE_SIZE`, "used node bytes
+exceed its declared node size") — so the field itself is not an `h5policy`
+gap. Reachable via ordinary group/link iteration
+(`H5Literate2`/`h5py`'s `Group.keys()`). Real consequence:
+
+- **Stock build** (no sanitizers): fails cleanly with `H5C__load_entry():
+  incorrect metadata checksum after all read attempts` — consistent with,
+  not proof against, an out-of-bounds read that happened to land on other
+  valid heap memory this run.
+- **Fresh ASan build** (`-fsanitize=address`, built specifically to settle
+  this): **crashes**, both variants, at the exact predicted line:
+  ```
+  AddressSanitizer:DEADLYSIGNAL
+  ERROR: AddressSanitizer: BUS on unknown address, caused by a READ
+    #0 H5F_get_checksums              H5Fio.c:534
+    #1 H5B2__cache_leaf_verify_chksum  H5B2cache.c:973   (or _int_verify_chksum, H5B2cache.c:573)
+  ```
+  A genuine out-of-bounds heap read — ~721KB requested against a ~512-byte
+  real allocation — hard enough to hit an unmapped page rather than merely
+  tripping a heap-buffer-overflow report. The unmodified seed, run through
+  the identical reproducer, completes cleanly every time.
+
+**Why this sits here and not in the main table:** `h5policy` already
+independently rejects the corruption via a real, dedicated check on
+`node_size`-vs-used-bytes — the *field* is fully covered. What's
+uncatalogued is the *mechanism*: libhdf5's own checksum-verification step
+is the thing that performs the unsafe read, with nothing — not even an
+assert — standing between the raw `node_nrec` value and the read length it
+drives. Same shape as `max_idx_set` above: a real, severe, currently-live
+hazard in libhdf5 that a from-scratch reimplementation happens to defend
+against, not a masked check that could be un-masked to fix it.
+
+### Free-space managers — `max_sect_addr` — unbounded per-section address width, already caught by `h5policy`
+
+`fspace->max_sect_addr` — "size of the address space free-space sections are
+within (log2 of actual value)" — is decoded raw at `H5FScache.c:282`
+(`UINT16DECODE`) with zero validation, not even an assert. `H5FS__sinfo_new`
+(`H5FSsection.c:131`) uses it directly to compute the byte-width for *every*
+section's address field for the life of the structure:
+
+```c
+sinfo->sect_off_size = (fspace->max_sect_addr + 7) / 8;
+```
+
+`H5FS__cache_sinfo_deserialize` (`H5FScache.c:1010`) then decodes each
+section's address with `UINT64DECODE_VAR(image, sect_addr,
+sinfo->sect_off_size)` — `DECODE_VAR` (`H5encode.h:192-201`) reads exactly
+that many bytes with no cap of any kind:
+
+```c
+#define DECODE_VAR(p, n, l) \
+    do { size_t _i; n = 0; (p) += l; \
+         for (_i = 0; _i < l; _i++) n = (n << 8) | *(--p); \
+         (p) += l; } while (0)
+```
+
+Since `max_sect_addr` is a raw `uint16_t`, it can reach 65535, making
+`sect_off_size = 8192` — an 8192-byte read for a single address field,
+against a real section-info buffer typically tens to low hundreds of bytes.
+
+**Measured:** patched only `max_sect_addr` (header offset 619+44=663, 2
+bytes) from 63 to `0xFFFF` in the same tracked seed used above, leaving the
+section counts and list untouched.
+
+- **`h5policy --profile untrusted-strict`: rejects outright** —
+  `H5_CORRUPT_FSM_SECTION_OVERRUN` (`h5policy_walk_fspace_sections`,
+  `h5_messages.pk:1166`, whose own `off_size` is computed the same way, via
+  `h5policy_bytes_for_bits(max_addr_bits)`). **Not a coverage gap.**
+- **Stock build** (`h5stat -s`): does not crash, but produces visibly wrong
+  output — 2 of 3 real sections in the corrupted manager replaced with
+  garbage "size 0" phantom entries.
+- **Fresh ASan build** (reused from the V2-B-tree area, unmodified): a
+  minimal C reproducer calling `H5Fget_free_sections()` crashes at the exact
+  predicted line:
+  ```
+  AddressSanitizer: heap-buffer-overflow H5FScache.c:1010
+    in H5FS__cache_sinfo_deserialize
+  0x... is located 8142 bytes after 71-byte region [...]
+  ```
+  matching the predicted ~8192-byte width almost exactly. The unmodified
+  seed runs cleanly through the identical reproducer.
+
+**Why the sibling computation, `sinfo->nbins`, is not similarly dangerous:**
+`sinfo->nbins = H5VM_log2_gen(fspace->max_sect_size)` is self-limiting —
+`log2` of even a full 64-bit value tops out around 64 — while
+`sect_off_size`'s linear `(max_sect_addr+7)/8` formula has no such ceiling.
+
+**Why this sits here and not in the main table:** same shape as
+`max_idx_set`/`node_nrec` above — `h5policy` already independently rejects
+the corruption via a real, dedicated check computed the identical way
+libhdf5 computes the dangerous width, so the *field* is fully covered.
+What's uncatalogued is the *mechanism*: nothing in libhdf5 itself — not even
+an assert — stands between the raw value and the read length it drives.
+
+**Not chased further:** the *low* end of `max_sect_addr` (e.g. 0, making
+`sect_off_size = 0`) — plausible as a different kind of misalignment (every
+subsequent address field silently collapsing to zero-width), not
+fixture-tested this round.
+
+### Metadata-cache images — prefetched-entry deserialization — checksum verification skipped entirely by design, already caught by `h5policy`
+
+When a metadata cache image (MDCI) is loaded, each entry's raw bytes are
+copied wholesale into an in-memory "prefetched" placeholder
+(`H5C__reconstruct_cache_entry`, `H5Cimage.c:2700-2899`) — bounds-checked
+against the cache-image block's own buffer (`H5_IS_BUFFER_OVERFLOW`, real,
+not the finding here). When the application later touches that address,
+`H5C__deserialize_prefetched_entry` (`H5Centry.c:1786`) converts the
+placeholder into a real typed entry. Its own comment states the design
+explicitly:
+
+```c
+/* Since the size of the on disk image is known exactly, there is
+ * no need for either a call to the get_initial_load_size() callback,
+ * or retries if the H5C__CLASS_SPECULATIVE_LOAD_FLAG flag is set.
+ * Similarly, there is no need to clamp possible reads beyond
+ * EOF.
+ */
+len = pf_entry_ptr->size;
+if (NULL == (thing = type->deserialize(pf_entry_ptr->image_ptr, len, udata, &dirty)))
+    ...
+```
+
+It calls `type->deserialize()` directly — skipping the `verify_chksum` step
+a normal fresh on-disk load always runs first. This is not assert-masked;
+there is no assert involved at all. It is a deliberate, commented design
+choice to trust cache-image content as already validated — and, measured
+directly (not assumed), that trust turns out to have no real boundary in
+libhdf5's own read path at all.
+
+Three separate checksum layers are involved here, worth distinguishing
+precisely: (1) the MDCI *message* itself (the cache image's declared
+`addr`/`size`) lives inside a normal v2 object-header chunk, whose own
+checksum genuinely is verified, like any object header's; (2) the
+cache-image *block*'s own trailing checksum, computed once over the whole
+block at write time (`H5C__construct_cache_image_buffer`,
+`H5Cimage.c:301-304`); and (3) each individual entry's own type-specific
+internal checksum (the object-header test below). Grepping every
+`H5_checksum_metadata` call in `H5Cimage.c` finds both occurrences confined
+to the write path (one real, one inside a debug-only self-check) — **there
+is no call to verify layer 2 anywhere in the read path**, confirmed
+directly: corrupting the block's own trailing checksum, without resealing
+it, opens exactly as cleanly as the inner-entry test below. So libhdf5's
+own read path checks neither the block-level checksum nor any individual
+entry's checksum — only layer 1 (the message's own container checksum) is
+real, and it protects only the address/length declaration, not the
+block's actual content.
+
+**Measured, not assumed — with a direct control-vs-mutant contrast.** Used
+the tracked seed `h5policy/tests/valid/cache_image.h5` (root group +
+"indexed" group + "payload" dataset; cache image with 3 real entries, all
+object headers).
+
+- **Control** (a fresh, cache-image-free file, same shape,
+  `libver="latest"` to force v2 object headers): flipped one bit in the
+  root group's real, on-disk object header's own trailing Jenkins
+  checksum. Opening it: `RuntimeError: Unable to get group info (incorrect
+  metadata checksum after all read attempts)` — cleanly rejected, as a
+  normal load always is.
+- **Mutant (layer 3, inner entry)** (the same seed, cache image intact):
+  flipped the identical bit in the identical checksum field, but inside
+  the cache-image entry's copy of that header. Resealed only the cache
+  image's own outer block checksum around it (Jenkins lookup3, not
+  cryptographic — trivially attacker-computable, reused from `h5mutate`).
+  Opening it: **succeeds completely silently** — `h5py.File(...)` opens
+  without error, and every attribute/group/dataset reads back fine.
+- **Mutant (layer 2, outer block)** (the same seed again): corrupted the
+  cache-image block's own trailing checksum directly, one byte, with
+  **no** resealing at all. Opening it: **also succeeds completely
+  silently** — confirming layer 2 is never checked either.
+
+**`h5policy` coverage: not a gap for either layer.** `--profile
+untrusted-strict` correctly rejects both mutants — the inner-entry
+corruption via `H5_CORRUPT_BAD_CHECKSUM`, "object-header checksum
+mismatch," at offset 48; the outer-block corruption via the same code,
+"metadata cache image checksum mismatch," at offset 2766 — because
+`h5policy`'s own cache-image handling independently computes and verifies
+both the block's own checksum and each replayed entry's checksum against
+its logical address (its README: "replays all validated cached entry
+bodies through the ordinary bounded metadata decoder"). Same shape as
+`node_nrec`/`max_sect_addr` above: real, severe, measured libhdf5 defects
+that `h5policy` already independently defends against.
+
+**Honest scope of the "attacker value" here.** Since Jenkins lookup3 is
+not cryptographic, a fully-capable attacker constructing a file from
+scratch can always compute a matching checksum for whatever bytes they
+want — so this specific bypass mostly matters for *accidental* corruption
+(bit-rot, torn writes, degraded storage media) rather than deliberate,
+adversarial tampering. A real but different concern from "attacker injects
+arbitrary content," and the two should not be conflated.
+
+**Also checked, and retracted after review — not a finding:** swapping one
+real, validly-checksummed cache-image entry's content into a *different*
+entry's address slot (making the root group's cache-image entry actually
+contain the "indexed" group's real content) also opens silently, and
+`h5policy` also accepts it with zero findings. This was first reported as
+a severe gap, but it doesn't hold up on scrutiny, for a simple reason: any
+attacker who can write the file's bytes at all could get the exact same
+result — a root group that directly contains what "indexed" used to
+contain — just by writing an ordinary, non-cache-image file with the
+honest HDF5 API. No trick, no bypass, and nothing about the result is
+corrupt. So this test didn't show anything specific to how cache images
+work; it only showed that an attacker who controls a file's bytes can make
+the file say whatever they want, which is true of every file format and
+isn't a bug on its own.
+
+**Not chased further:** a second, independent code defect exists at
+`H5Cimage.c:2820-2824` — `H5C__reconstruct_cache_entry`'s "Validate address
+range" check references the entry's `size` field *before* it is decoded
+three lines later (`H5Cimage.c:2829`), so it always checks against a stale
+zero (`H5FL_CALLOC`-initialized) rather than the real size, meaning
+`addr + size <= eoa` is never actually validated with the real size,
+anywhere. Attempted to weaponize this into an EOF/EOA overrun for a
+naturally-reachable entry: a naive size inflation was cleanly caught by a
+*different*, correctly-implemented check (`H5_IS_BUFFER_OVERFLOW` against
+the cache-image block's own buffer) in both `h5policy`
+(`H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE`) and the real build ("invalid
+entry size"). Because the cache-image block is always allocated last in a
+library-written file (at the then-current EOA), any naturally-reachable
+entry's real address is inherently smaller than the cache-image block's
+own address, so `entry.addr + entry.size <= entry.addr + image_len <
+image_addr + image_len <= eoa` always holds structurally — the vacuous
+check's absence cannot be exploited via the ordinary "natural placement"
+path. Escaping that would need a hand-constructed file with the
+cache-image block placed before a real object's address (not achievable
+by patching a real seed), and even then the consequence is unclear, since
+`addr`/`size` are just labels on an already-safe, fully-backed heap buffer
+for a read-only scenario. Left as a documented, real code defect with no
+demonstrated independent consequence.
+
 ## Status: remaining areas (not started)
 
 | Area | libhdf5 source | Notes |
 |---|---|---|
-| V2 B-trees | `H5B2*.c` | Existing precedent: `registry/cases/v2-btree-record-size-zero-assert-only.yml` (confirmed x86-64-only SIGFPE; arm64 doesn't trap) |
 | Dataset chunk records | `H5Dchunk/btree/btree2/farray/earray/single/none.c` | `chunk-dim-product-64bit-overflow.yml` names one case directly |
 | Fractal heaps | `H5HF*.c` (16 files) | Not started |
-| Free-space managers | `H5FS*.c` | Not started |
-| Metadata-cache images | `H5AC*.c`, cache-image code | Not started |
