@@ -1,10 +1,11 @@
-# HDF5 Policy RFC — Introduction & Use Cases (draft)
+# HDF5 Policy RFC — Use Cases and Scope (draft)
 
-> **Draft for review.** This covers the RFC's Introduction and Section 1
-> (Use cases) only. The legitimate-use scenarios (§1.2) are stated from each
-> feature's documented intent; naming the specific communities that rely on
-> them is optional enrichment for later, not a prerequisite — see the "why
-> incompleteness is the point" note in §1.2.
+> **Draft for review.** This covers the RFC's Introduction, Section 1 (Use
+> cases), and Section 2 (Scope and controls inventory). Section 3 (API),
+> Section 4 (Implementation and test plan), and Further considerations are still
+> to come. The legitimate-use scenarios (§1.2) are stated from each feature's
+> documented intent; naming the specific communities that rely on them is
+> optional enrichment for later, not a prerequisite.
 
 ## Introduction
 
@@ -176,4 +177,102 @@ The scenarios translate into requirements for Sections 2–4:
    echoes a concrete ask from the h5py discussion
    ([h5py issue #2891](https://github.com/h5py/h5py/issues/2891)), where
    maintainers floated a tri-state `obj.internal` property (internal / external /
-   unknown) so a caller can check before reading.
+   unknown) so a caller can check before reading. Detectability here is a
+   *complement* to enforcement, not a substitute for it: detection *instead of*
+   enforcement — "detect-only," leaving each application to check and act — is a
+   weaker alternative, because it protects only applications that remember to
+   check, which the motivating incidents did not. It is recorded among the
+   alternatives (Further considerations), not adopted as the control.
+
+## 2. Scope and controls inventory
+
+Section 1 established *why* the library must separate validation from
+authorization, and *what* the design must provide. This section is the
+**supply** side to Section 1's demand: it enumerates, action by action, exactly
+what the library controls. For each trust-boundary-crossing action it records
+the action, its risk family, the control that gates it, the behavior today, and
+the behavior this RFC proposes. The result is an auditable map — a reviewer can
+confirm that every action Section 1 raised has a defined control, and that none
+is left implicit.
+
+### 2.1 In scope and out of scope
+
+**In scope.** Every action by which a *well-formed* HDF5 file, read with default
+settings, causes the library to cross a trust boundary — open another file,
+reach a filesystem path, or load and run external code — during normal
+operation. These are the actions inventoried in Section 2.2.
+
+**Out of scope** (deliberately excluded; several recur in Further
+considerations):
+
+- **Plugin provenance / signature verification.** The plugin-load *action* is in
+  scope (Section 2.2); the provenance *control* on it is not — it is a separate
+  RFC's concern, not a later phase of this one. This RFC gates plugin loading
+  *on or off* — *may any plugin load for this file?* Verifying the
+  origin and integrity of the plugin code (signing) — *which* code is trustworthy
+  to run — is a separate, complementary control, the subject of the Signed
+  Plugins RFC. Provenance layers on top of this on/off authorization gate rather
+  than replacing it: a validly signed plugin can still be malicious.
+- **Validation and parser hardening.** Detecting malformed or corrupt metadata
+  is a separate concern; this RFC governs authorization of *valid* files and
+  does not change how invalid files are rejected.
+- **Application-selected remote drivers** — the read-only `ros3`
+  (`H5Pset_fapl_ros3`, Amazon S3 and S3-compatible stores) and `hdfs`
+  (`H5Pset_fapl_hdfs`) VFDs. These are selected by the application through the
+  FAPL, not induced by the file, so they are not a file-driven trust-boundary
+  crossing. (The multi / family driver *is* in scope, because its member layout
+  travels with the file.)
+- **Resource-exhaustion and decompression-bomb defenses.** A valid file can be
+  crafted to exhaust memory, CPU, or time on read — for example a metadata count
+  that drives a huge allocation, or a small compressed chunk that inflates to
+  many gigabytes when decompressed (a decompression bomb). Guarding against this
+  is a distinct axis — resource budgets and quotas — from authorizing
+  trust-boundary actions, and belongs to a separate mechanism.
+- **The write path.** This RFC protects a process *reading* an untrusted file;
+  an application's own deliberate use of these features when creating files is
+  its own choice.
+
+### 2.2 The controls inventory
+
+| Action | Family | Control | Current default | Proposed default (nothing declared) |
+|---|---|---|---|---|
+| External storage read (a dataset's raw bytes in a separate file) | file-reference | allow / deny + path confinement | allow — because valid | deny; opt-in within a confined path |
+| Virtual dataset (VDS) source open | file-reference | allow / deny + path confinement | allow — because valid | deny; opt-in within a confined path |
+| External link traversal | file-reference | allow / deny + path confinement | allow — because valid | deny; opt-in within a confined path |
+| Multi / family VFD member open | file-reference | allow / deny + path confinement | allow — because valid | deny; opt-in within a confined path |
+| Dynamic filter plugin load | code-execution | allow / deny (on/off gate) | allow — because valid | deny; opt-in |
+| Dynamic VOL / VFD plugin load | code-execution | allow / deny (on/off gate) | allow — because valid | deny; opt-in |
+
+Three things the table makes explicit:
+
+- **The current default is identical on every row** — *allow, because the file
+  is valid.* That uniform column is exactly the validity-equals-authorization
+  conflation Section 1 identifies.
+- **The proposed default is the behavior when the application declares
+  nothing.** The policy profiles (Section 3) adjust these, within the invariant
+  that a denied action always fails safe and visibly (Section 1.3, requirements
+  4–5), and within a migration path that does not break existing files overnight
+  (Further considerations).
+- **The control differs by family.** File-reference actions add *path
+  confinement* — an allowed prefix, with `/proc`, `/sys`, `/dev` denied and care
+  for `..` and symlinks. For code-execution actions this RFC provides only the
+  on/off gate; their other axis — *provenance* (which code is trustworthy,
+  Section 1.3, requirement 3) — is a complementary control out of scope here
+  (Section 2.1). Dynamic VOL / VFD plugin loading shares the legitimate-use
+  rationale of filters (Section 1.2, L5); filters are simply the most common
+  case.
+
+### 2.3 Actors
+
+Only three parties take part in an authorization decision:
+
+- **The application** declares the per-file trust and policy, through the FAPL,
+  at or before open. It is the only party that can know whether a given file is
+  trusted.
+- **The file** is the subject the policy is applied to — never a trusted source
+  of its own authorization. Nothing in its bytes may raise its own privilege.
+- **The library** enforces the declared policy at each action's chokepoint and
+  reports a denial as a distinct, recoverable error.
+
+This is the concrete form of Section 1.3, requirement 1: trust is *declared by
+the application and enforced by the library, never inferred from the file.*
